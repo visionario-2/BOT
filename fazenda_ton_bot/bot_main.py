@@ -15,6 +15,9 @@ import uvicorn
 # ========= CONFIG ==========
 # Telegram
 TOKEN = os.getenv('TOKEN')  # token do bot do Telegram
+OWNER_ID = int(os.getenv("OWNER_TELEGRAM_ID", "0"))
+def is_admin(uid: int) -> bool:
+    return OWNER_ID and uid == OWNER_ID
 
 # App público (URL do Render depois do 1º deploy)
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")  # ex: https://seu-servico.onrender.com
@@ -57,6 +60,7 @@ def init_db():
         PRIMARY KEY (telegram_id, animal)
     )''')
 
+    # Evitar crédito duplicado de depósitos
     cur.execute('''CREATE TABLE IF NOT EXISTS pagamentos (
         invoice_id TEXT PRIMARY KEY,
         user_id INTEGER,
@@ -66,6 +70,17 @@ def init_db():
     )''')
     cur.execute('''CREATE UNIQUE INDEX IF NOT EXISTS idx_pagamentos_invoice
                    ON pagamentos(invoice_id)''')
+
+    # Fila de saques
+    cur.execute('''CREATE TABLE IF NOT EXISTS saques (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        telegram_id INTEGER,
+        valor_ton REAL,
+        carteira TEXT,
+        status TEXT DEFAULT 'pendente',   -- pendente | pago | cancelado
+        criado_em TEXT,
+        pago_em TEXT
+    )''')
 
     con.commit()
 
@@ -152,7 +167,7 @@ async def cryptopay_webhook(request: Request):
     if data.get("update_type") != "invoice_paid":
         return {"ok": True}
 
-    inv = data.get("payload", {}).get("invoice", {})  # estrutura do Crypto Pay
+    inv = data.get("payload", {}).get("invoice", {})
     invoice_id = str(inv.get("invoice_id") or inv.get("id") or "")
     if not invoice_id:
         return {"ok": True}
@@ -170,6 +185,7 @@ async def cryptopay_webhook(request: Request):
     CASH_POR_REAL = int(os.getenv("CASH_POR_REAL", "100"))
     cash = int(round(reais * CASH_POR_REAL))
 
+    # ---- anti-duplicação: só processa se conseguir inserir a invoice ----
     try:
         cur.execute(
             "INSERT INTO pagamentos (invoice_id, user_id, valor_reais, cash, criado_em) "
@@ -178,7 +194,7 @@ async def cryptopay_webhook(request: Request):
         )
         con.commit()
     except sqlite3.IntegrityError:
-        return {"ok": True}
+        return {"ok": True}  # já processada
 
     if cash > 0:
         cur.execute(
@@ -186,8 +202,6 @@ async def cryptopay_webhook(request: Request):
             (cash, user_id)
         )
         con.commit()
-
-        # avisa o usuário
         try:
             await bot.send_message(
                 user_id,
@@ -401,9 +415,12 @@ async def trocar_cash(msg: types.Message):
 @dp.message(lambda msg: msg.text == "🏦 Sacar")
 async def sacar(msg: types.Message):
     await msg.answer(
-        "Envie o valor em TON e a carteira TON para sacar. Exemplo:\n`2 UQxxxxxxxxxxxx`",
+        "Envie o valor em TON **e** a carteira TON na mesma mensagem.\n"
+        "Exemplo:\n`2.0 UQxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx`\n\n"
+        "_Dica: a carteira TON geralmente começa com `UQ` ou `EQ`._",
         parse_mode="Markdown"
     )
+
 
 @dp.message(lambda msg: msg.text == "👫 Indique & Ganhe")
 async def indicacao(msg: types.Message):
@@ -423,26 +440,125 @@ async def ajuda(msg: types.Message):
     )
 
 # Heurística: mensagem com número + espaço + endereço TON (evita conflitar com depósito custom)
-@dp.message(lambda msg: isinstance(msg.text, str) and ' ' in msg.text
-            and msg.text.split(' ')[0].replace('.', '', 1).isdigit()
-            and len(msg.text.split(' ')[1]) >= 30)
+@dp.message(lambda m: m.text and len(m.text.strip().split()) >= 2 and m.text.strip().split()[0].replace('.', '', 1).isdigit())
 async def processa_saque(msg: types.Message):
+    partes = msg.text.strip().split()
     try:
-        partes = msg.text.strip().split(' ')
         valor = float(partes[0])
         carteira = partes[1]
     except Exception:
-        await msg.answer("Formato inválido. Envie: VALOR CARTEIRA_TON")
+        await msg.answer("Formato inválido. Envie: `VALOR CARTEIRA_TON`", parse_mode="Markdown")
         return
+
+    # validações simples
+    if valor <= 0:
+        await msg.answer("Valor inválido.")
+        return
+    if not (carteira.startswith("UQ") or carteira.startswith("EQ")) or len(carteira) < 36:
+        await msg.answer("Carteira TON aparentemente inválida. Verifique e envie novamente.")
+        return
+
     user_id = msg.from_user.id
-    cur.execute("SELECT COALESCE(saldo_ton,0) FROM usuarios WHERE telegram_id=?", (user_id,))
-    saldo = cur.fetchone()[0]
+    cur.execute("SELECT saldo_ton FROM usuarios WHERE telegram_id=?", (user_id,))
+    r = cur.fetchone()
+    saldo = r[0] if r else 0.0
+
     if saldo < valor:
-        await msg.answer("Saldo insuficiente.")
+        await msg.answer(f"Saldo insuficiente. Seu saldo TON é `{saldo:.4f}`.", parse_mode="Markdown")
         return
-    cur.execute("UPDATE usuarios SET saldo_ton=saldo_ton-? WHERE telegram_id=?", (valor, user_id))
+
+    # Reserva: debita já para não gastar duas vezes
+    cur.execute("UPDATE usuarios SET saldo_ton = saldo_ton - ? WHERE telegram_id=?", (valor, user_id))
+    cur.execute(
+        "INSERT INTO saques (telegram_id, valor_ton, carteira, status, criado_em) VALUES (?, ?, ?, 'pendente', ?)",
+        (user_id, valor, carteira, datetime.now().isoformat())
+    )
+    saque_id = cur.lastrowid
     con.commit()
-    await msg.answer(f"Saque de {valor:.4f} TON para a carteira {carteira} está sendo processado.\n\n(Simulação MVP)")
+
+    await msg.answer(
+        f"✅ Pedido de saque **#{saque_id}** criado.\n"
+        f"Valor: `{valor:.4f}` TON\nCarteira: `{carteira}`\n\n"
+        f"Acompanhe com `/meussaques`.",
+        parse_mode="Markdown"
+    )
+
+    # avisa o admin
+    if OWNER_ID:
+        try:
+            await bot.send_message(
+                OWNER_ID,
+                f"🔔 Novo saque pendente #{saque_id}\nUser {user_id}\n{valor:.4f} TON → {carteira}"
+            )
+        except Exception:
+            pass
+
+
+@dp.message(Command("meussaques"))
+async def meus_saques(msg: types.Message):
+    rows = cur.execute(
+        "SELECT id, valor_ton, carteira, status, criado_em, IFNULL(pago_em, '') "
+        "FROM saques WHERE telegram_id=? ORDER BY id DESC LIMIT 10",
+        (msg.from_user.id,)
+    ).fetchall()
+    if not rows:
+        await msg.answer("Você ainda não tem pedidos de saque.")
+        return
+
+    linhas = []
+    for (sid, val, cart, status, criado, pago) in rows:
+        quando = (criado or "").split("T")[0]
+        extra = f" • pago em {(pago or '').split('T')[0]}" if (pago or "").strip() else ""
+        linhas.append(f"#{sid} • {val:.4f} TON • {status}{extra}")
+    await msg.answer("🧾 *Seus últimos saques:*\n" + "\n".join(linhas), parse_mode="Markdown")
+
+
+@dp.message(Command("adm_saques"))
+async def adm_saques(msg: types.Message):
+    if not is_admin(msg.from_user.id):
+        return
+    rows = cur.execute(
+        "SELECT id, telegram_id, valor_ton, carteira, criado_em "
+        "FROM saques WHERE status='pendente' ORDER BY id"
+    ).fetchall()
+    if not rows:
+        await msg.answer("Sem saques pendentes.")
+        return
+    linhas = [f"#{sid} • user {uid} • {val:.4f} TON • {carteira}" for (sid, uid, val, carteira, _) in rows]
+    await msg.answer(
+        "⏳ *Pendentes:*\n" + "\n".join(linhas) + "\n\nMarcar pago: `/pagar ID`",
+        parse_mode="Markdown"
+    )
+
+@dp.message(Command("pagar"))
+async def pagar_cmd(msg: types.Message):
+    if not is_admin(msg.from_user.id):
+        return
+    p = msg.text.strip().split()
+    if len(p) != 2 or not p[1].isdigit():
+        await msg.answer("Use: `/pagar ID`", parse_mode="Markdown")
+        return
+    sid = int(p[1])
+    row = cur.execute(
+        "SELECT telegram_id, valor_ton, carteira, status FROM saques WHERE id=?",
+        (sid,)
+    ).fetchone()
+    if not row:
+        await msg.answer("ID não encontrado.")
+        return
+    uid, val, cart, status = row
+    if status != "pendente":
+        await msg.answer("Esse saque não está pendente.")
+        return
+
+    cur.execute("UPDATE saques SET status='pago', pago_em=? WHERE id=?", (datetime.now().isoformat(), sid))
+    con.commit()
+    await msg.answer(f"✅ Saque #{sid} marcado como *PAGO*.", parse_mode="Markdown")
+
+    try:
+        await bot.send_message(uid, f"✅ Seu saque #{sid} foi enviado.\nValor: {val:.4f} TON\nCarteira: {cart}")
+    except Exception:
+        pass
 
 # ========= INICIAR BOT ==========
 def start_bot():
