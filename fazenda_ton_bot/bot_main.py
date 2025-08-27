@@ -41,12 +41,14 @@ def init_db():
         carteira_ton TEXT,
         criado_em TEXT
     )''')
+
     cur.execute('''CREATE TABLE IF NOT EXISTS animais (
         nome TEXT PRIMARY KEY,
         preco INTEGER,
         rendimento REAL,
         emoji TEXT
     )''')
+
     cur.execute('''CREATE TABLE IF NOT EXISTS inventario (
         telegram_id INTEGER,
         animal TEXT,
@@ -54,7 +56,19 @@ def init_db():
         ultima_coleta TEXT,
         PRIMARY KEY (telegram_id, animal)
     )''')
+
+    cur.execute('''CREATE TABLE IF NOT EXISTS pagamentos (
+        invoice_id TEXT PRIMARY KEY,
+        user_id INTEGER,
+        valor_reais REAL,
+        cash INTEGER,
+        criado_em TEXT
+    )''')
+    cur.execute('''CREATE UNIQUE INDEX IF NOT EXISTS idx_pagamentos_invoice
+                   ON pagamentos(invoice_id)''')
+
     con.commit()
+
 
 def cadastrar_animais():
     animais = [
@@ -133,44 +147,57 @@ def verify_cryptopay_signature(body_bytes: bytes, signature_hex: str, token: str
 # ========= WEBHOOK CRYPTO PAY ==========
 @app.post("/webhook/cryptopay")
 async def cryptopay_webhook(request: Request):
-    raw = await request.body()
-    sig = request.headers.get("crypto-pay-api-signature")
-    if not CRYPTOPAY_TOKEN or not verify_cryptopay_signature(raw, sig, CRYPTOPAY_TOKEN):
-        # assinatura inválida ou token ausente -> ignora
+    data = await request.json()
+
+    if data.get("update_type") != "invoice_paid":
         return {"ok": True}
 
-    data = await request.json()
-    if data.get("update_type") == "invoice_paid":
-        inv = data.get("payload", {})  # objeto Invoice
-        # user_id que colocamos em payload na criação
-        try:
-            user_id = int(inv.get("payload", "0"))
-        except Exception:
-            user_id = 0
+    inv = data.get("payload", {}).get("invoice", {})  # estrutura do Crypto Pay
+    invoice_id = str(inv.get("invoice_id") or inv.get("id") or "")
+    if not invoice_id:
+        return {"ok": True}
 
-        # Se a invoice foi criada em BRL (currency_type=fiat), geralmente "amount" é em fiat
-        try:
-            reais = float(inv.get("amount", "0"))
-        except Exception:
-            reais = 0.0
+    try:
+        user_id = int(inv.get("payload"))
+    except Exception:
+        return {"ok": True}
 
-        cash = int(reais * CASH_POR_REAL)
-        if user_id and cash > 0:
-            cur.execute(
-                "UPDATE usuarios SET saldo_cash = COALESCE(saldo_cash,0) + ? WHERE telegram_id = ?",
-                (cash, user_id)
+    try:
+        reais = float(inv.get("price_amount"))
+    except Exception:
+        reais = 0.0
+
+    CASH_POR_REAL = int(os.getenv("CASH_POR_REAL", "100"))
+    cash = int(round(reais * CASH_POR_REAL))
+
+    try:
+        cur.execute(
+            "INSERT INTO pagamentos (invoice_id, user_id, valor_reais, cash, criado_em) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (invoice_id, user_id, reais, cash, datetime.now().isoformat())
+        )
+        con.commit()
+    except sqlite3.IntegrityError:
+        return {"ok": True}
+
+    if cash > 0:
+        cur.execute(
+            "UPDATE usuarios SET saldo_cash = saldo_cash + ? WHERE telegram_id = ?",
+            (cash, user_id)
+        )
+        con.commit()
+
+        # avisa o usuário
+        try:
+            await bot.send_message(
+                user_id,
+                f"✅ Pagamento confirmado!\nR$ {reais:.2f} → {cash} cash creditados."
             )
-            con.commit()
-            try:
-                await bot.send_message(
-                    user_id,
-                    f"✅ Pagamento confirmado!\nR$ {reais:.2f} → `{cash}` cash creditados.",
-                    parse_mode="Markdown"
-                )
-            except Exception:
-                pass
+        except Exception:
+            pass
 
     return {"ok": True}
+
 
 # ========= UI / MENUS ==========
 def menu():
