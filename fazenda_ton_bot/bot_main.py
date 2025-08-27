@@ -423,6 +423,7 @@ def start_bot():
 
 @app.on_event("startup")
 async def on_startup():
+    await bot.delete_webhook(drop_pending_updates=True)
     start_bot()
 
 # ========== FASTAPI MAIN ==========
