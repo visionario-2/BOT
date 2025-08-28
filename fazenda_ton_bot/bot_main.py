@@ -214,15 +214,13 @@ async def cryptopay_webhook(request: Request):
 
 
 # ========= UI / MENUS ==========
-def menu():
-
-    def kb_voltar():
+def kb_voltar():
     return types.ReplyKeyboardMarkup(
         keyboard=[[types.KeyboardButton(text="⬅️ Voltar")]],
         resize_keyboard=True
     )
 
-    
+def menu():
     return types.ReplyKeyboardMarkup(
         keyboard=[
             [types.KeyboardButton(text="🐾 Meus Animais"), types.KeyboardButton(text="💰 Meu Saldo")],
@@ -232,6 +230,7 @@ def menu():
         ],
         resize_keyboard=True
     )
+
 
 # ========= HANDLERS ==========
 @dp.message(Command('start'))
