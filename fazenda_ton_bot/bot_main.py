@@ -22,6 +22,8 @@ def is_admin(uid: int) -> bool:
 # App público (URL do Render depois do 1º deploy)
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")  # ex: https://seu-servico.onrender.com
 
+BOT_USERNAME = os.getenv("BOT_USERNAME", "SEU_BOT_USERNAME")  # ex.: "bot_kjp7"
+
 # Banco de Dados
 DB_PATH = os.getenv("DB_PATH", "fazenda.db")
 
@@ -504,22 +506,22 @@ async def sacar(msg: types.Message):
 async def indicacao(msg: types.Message):
     user_id = msg.from_user.id
 
-    # conta quantos usuários você indicou
+    # Conta quantas pessoas esse usuário indicou
     row = cur.execute("SELECT COUNT(*) FROM indicacoes WHERE por=?", (user_id,)).fetchone()
-    indicacoes = row[0] if row and row[0] is not None else 0
+    total_refs = row[0] if row else 0
 
-    # pega o @username do bot para montar o link correto
-    me = await bot.get_me()
-    username = me.username or "seu_bot"  # fallback se não tiver username
-    link = f"https://t.me/{username}?start={user_id}"
+    # Link de convite (deep link)
+    link = f"https://t.me/{BOT_USERNAME}?start={user_id}"
 
     texto = (
-        f"🎉 *Indique & Ganhe*\n\n"
-        f"Convide amigos e receba *{REF_PCT:.0f}%* de cada depósito que eles fizerem!\n"
-        f"🔗 Seu link: {link}\n\n"
-        f"👥 *Indicações:* `{indicacoes}`"
+        "🎁 <b>Indique & Ganhe</b>\n\n"
+        f"Convide amigos e receba <b>{REF_PCT:.0f}%</b> de cada depósito que eles fizerem.\n\n"
+        f"👥 <b>Indicações:</b> {total_refs}\n"
+        f"🔗 <b>Seu link:</b> <code>{link}</code>"
     )
-    await msg.answer(texto, parse_mode="Markdown")
+
+    # Usa HTML para evitar problemas com underscores no link
+    await msg.answer(texto, parse_mode="HTML")
 
 
 @dp.message(lambda msg: msg.text == "❓ Ajuda/Suporte")
