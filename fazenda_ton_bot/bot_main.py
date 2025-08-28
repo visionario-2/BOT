@@ -179,27 +179,45 @@ def verify_cryptopay_signature(body_bytes: bytes, signature_hex: str, token: str
 async def cryptopay_webhook(request: Request):
     data = await request.json()
 
+    # Aceita só quando efetivamente pago
     if data.get("update_type") != "invoice_paid":
         return {"ok": True}
 
-    inv = data.get("payload", {}).get("invoice", {})
-    invoice_id = str(inv.get("invoice_id") or inv.get("id") or "")
+    # --- Tenta achar o objeto da invoice em formatos diferentes ---
+    payload = data.get("payload") or {}
+    inv = payload.get("invoice") or payload  # alguns webhooks vem com payload.invoice, outros direto no payload
+
+    # invoice_id (string)
+    invoice_id = str(inv.get("invoice_id") or inv.get("id") or "").strip()
     if not invoice_id:
+        print("[cryptopay] webhook sem invoice_id:", data)
         return {"ok": True}
 
+    # user_id (vem no campo payload/custom_payload que você enviou em createInvoice)
+    user_id_str = str(inv.get("payload") or inv.get("custom_payload") or "").strip()
     try:
-        user_id = int(inv.get("payload"))
+        user_id = int(user_id_str)
     except Exception:
+        print("[cryptopay] webhook sem user_id(payload):", data)
         return {"ok": True}
 
+    # Valor em reais: usa o primeiro que existir
+    raw_reais = (
+        inv.get("price_amount") or   # fiat
+        inv.get("fiat_amount")  or
+        inv.get("amount")       or   # alguns formatos
+        inv.get("paid_amount")  or
+        0
+    )
     try:
-        reais = float(inv.get("price_amount"))
+        reais = float(raw_reais)
     except Exception:
         reais = 0.0
 
+    # Converte para cash
     cash = int(round(reais * CASH_POR_REAL))
 
-    # anti-duplicação
+    # 1) Idempotência (se já processou esta invoice, sai)
     try:
         cur.execute(
             "INSERT INTO pagamentos (invoice_id, user_id, valor_reais, cash, criado_em) "
@@ -208,15 +226,48 @@ async def cryptopay_webhook(request: Request):
         )
         con.commit()
     except sqlite3.IntegrityError:
-        return {"ok": True}  # já processada
+        return {"ok": True}
 
+    # 2) Garante que o usuário existe mesmo que nunca tenha usado /start
+    cur.execute(
+        "INSERT OR IGNORE INTO usuarios (telegram_id, criado_em) VALUES (?, ?)",
+        (user_id, datetime.now().isoformat())
+    )
+
+    # 3) Credita o depósito
     if cash > 0:
-        # 1) credita o pagador
         cur.execute(
-            "UPDATE usuarios SET saldo_cash = saldo_cash + ? WHERE telegram_id = ?",
+            "UPDATE usuarios SET saldo_cash = COALESCE(saldo_cash,0) + ? WHERE telegram_id=?",
             (cash, user_id)
         )
-        con.commit()
+
+    # 4) Bônus de indicação (4% por padrão via REF_PCT)
+    cur.execute("SELECT por FROM indicacoes WHERE quem=?", (user_id,))
+    row = cur.fetchone()
+    if row:
+        ref_id = int(row[0])
+        bonus = int(round(cash * REF_PCT / 100.0))
+        if bonus > 0:
+            cur.execute(
+                "INSERT OR IGNORE INTO usuarios (telegram_id, criado_em) VALUES (?, ?)",
+                (ref_id, datetime.now().isoformat())
+            )
+            cur.execute(
+                "UPDATE usuarios SET saldo_cash = COALESCE(saldo_cash,0) + ? WHERE telegram_id=?",
+                (bonus, ref_id)
+            )
+            try:
+                await bot.send_message(
+                    ref_id,
+                    f"🎁 Bônus de indicação: +{bonus} cash (amigo depositou R$ {reais:.2f})."
+                )
+            except Exception:
+                pass
+
+    con.commit()
+
+    # 5) Aviso ao pagador (só se teve cash>0)
+    if cash > 0:
         try:
             await bot.send_message(
                 user_id,
@@ -225,32 +276,8 @@ async def cryptopay_webhook(request: Request):
         except Exception:
             pass
 
-        try:
-            row_ref = cur.execute(
-                "SELECT por FROM indicacoes WHERE quem=?",
-                (user_id,)
-            ).fetchone()
-            if row_ref:
-                indicador_id = row_ref[0]
-                ref_cash = int(round(cash * REF_PCT / 100))
-                if ref_cash > 0:
-                    cur.execute(
-                        "UPDATE usuarios SET saldo_cash = saldo_cash + ? WHERE telegram_id=?",
-                        (ref_cash, indicador_id)
-                    )
-                    con.commit()
-                    try:
-                        await bot.send_message(
-                            indicador_id,
-                            f"🎁 Bônus de indicação: +{ref_cash} cash pelo depósito do seu indicado."
-                        )
-                    except Exception:
-                        pass
-        except Exception:
-            # qualquer erro aqui não bloqueia o depósito principal
-            pass
-
     return {"ok": True}
+
 
 
 
