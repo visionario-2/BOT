@@ -1,11 +1,12 @@
-import os
 import asyncio
 import sqlite3
 from datetime import datetime
 import hashlib
 import hmac
-import requests
+import os
 import time
+import requests
+
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
@@ -14,51 +15,156 @@ from fastapi import FastAPI, Request
 import uvicorn
 
 
-# --- COINGECKO: preço do TON em BRL com precisão + fallback ---
+# ===== Preço do TON em BRL – robusto, com cache, retries e múltiplas fontes =====
+
+# TTL do cache (segundos)
+PRICE_CACHE_SECONDS = int(os.getenv("PRICE_CACHE_SECONDS", "60"))
+# Fallback inicial caso tudo falhe no primeiro boot
+FALLBACK_TON_BRL = float(os.getenv("FALLBACK_TON_BRL", "17.0"))
+
+# cache do ÚLTIMO PREÇO VÁLIDO (nunca armazena 0)
+_TON_CACHE = {"price": FALLBACK_TON_BRL, "ts": 0.0}
+
+# Fontes
 COINGECKO_SIMPLE = "https://api.coingecko.com/api/v3/simple/price"
 COINGECKO_MARKETS = "https://api.coingecko.com/api/v3/coins/markets"
 
-CACHE_SECONDS = 60
-_ton_price_cache = {"price": 0.0, "ts": 0.0}
+BINANCE_TICKER = "https://api.binance.com/api/v3/ticker/price?symbol=TONUSDT"
+OKX_TICKER     = "https://www.okx.com/api/v5/market/ticker?instId=TON-USDT"
+
+# Câmbio USD/BRL (para transformar TON/USDT -> BRL; USDT ~ USD)
+FX_USD_BRL_1 = "https://open.er-api.com/v6/latest/USD"
+FX_USD_BRL_2 = "https://api.exchangerate.host/latest?base=USD&symbols=BRL"
+
+def _is_sane_brl(p: float) -> bool:
+    # rejeita valores absurds (ajuste se quiser)
+    return 0.1 <= p <= 1000.0
+
+def _try_with_retries(fn, attempts=(0.0, 0.5, 1.0)):
+    """Tenta chamar fn() com pequenos backoffs. Retorna float (>0) ou 0."""
+    for delay in attempts:
+        try:
+            v = float(fn())
+            if v > 0:
+                return v
+        except Exception:
+            pass
+        if delay:
+            time.sleep(delay)
+    return 0.0
+
+def _cg_simple_brl():
+    r = requests.get(
+        COINGECKO_SIMPLE,
+        params={"ids": "the-open-network", "vs_currencies": "brl", "precision": "full"},
+        timeout=10,
+    )
+    r.raise_for_status()
+    return float(r.json()["the-open-network"]["brl"])
+
+def _cg_markets_brl():
+    r = requests.get(
+        COINGECKO_MARKETS,
+        params={"vs_currency": "brl", "ids": "the-open-network"},
+        timeout=10,
+    )
+    r.raise_for_status()
+    data = r.json()
+    return float(data[0]["current_price"]) if isinstance(data, list) and data else 0.0
+
+def _binance_ton_usdt():
+    r = requests.get(BINANCE_TICKER, timeout=10)
+    r.raise_for_status()
+    return float(r.json()["price"])
+
+def _okx_ton_usdt():
+    r = requests.get(OKX_TICKER, timeout=10)
+    r.raise_for_status()
+    data = r.json()
+    # OKX retorna {"data":[{"last":"1.234"}],...}
+    return float(data["data"][0]["last"]) if "data" in data and data["data"] else 0.0
+
+def _usd_brl_rate():
+    # tenta 2 fontes simples, com retries
+    def _fx1():
+        r = requests.get(FX_USD_BRL_1, timeout=10)
+        r.raise_for_status()
+        return float(r.json()["rates"]["BRL"])
+
+    def _fx2():
+        r = requests.get(FX_USD_BRL_2, timeout=10)
+        r.raise_for_status()
+        return float(r.json()["rates"]["BRL"])
+
+    rate = _try_with_retries(_fx1)
+    if rate <= 0:
+        rate = _try_with_retries(_fx2)
+    return rate
+
+def _ton_brl_from_usdt_paths():
+    """Pega TON/USDT em corretoras e converte usando USD->BRL."""
+    usdt_price = _try_with_retries(_binance_ton_usdt)
+    if usdt_price <= 0:
+        usdt_price = _try_with_retries(_okx_ton_usdt)
+    if usdt_price <= 0:
+        return 0.0
+
+    usd_brl = _try_with_retries(_usd_brl_rate)
+    if usd_brl <= 0:
+        return 0.0
+
+    return usdt_price * usd_brl
 
 def get_ton_price_brl() -> float:
-    """Retorna preço do TON em BRL com cache de 60s e boa precisão."""
+    """
+    Retorna o preço do TON em BRL:
+      - cache por PRICE_CACHE_SECONDS
+      - CoinGecko (2 rotas) com retries
+      - fallback via corretoras (TON/USDT) * USD/BRL
+      - NUNCA retorna 0; se falhar tudo, devolve último válido do cache
+    """
     now = time.time()
-    if now - _ton_price_cache["ts"] < CACHE_SECONDS and _ton_price_cache["price"] > 0:
-        return _ton_price_cache["price"]
+    if (now - _TON_CACHE["ts"] < PRICE_CACHE_SECONDS) and _TON_CACHE["price"] > 0:
+        return _TON_CACHE["price"]
 
-    price = 0.0
-    try:
-        # 1) tenta rota "simple" pedindo precisão completa
-        r = requests.get(
-            COINGECKO_SIMPLE,
-            params={"ids": "the-open-network", "vs_currencies": "brl", "precision": "full"},
-            timeout=10,
-        )
-        r.raise_for_status()
-        price = float(r.json()["the-open-network"]["brl"])
-    except Exception:
+    # 1) CoinGecko simple
+    price = _try_with_retries(_cg_simple_brl)
+    if not _is_sane_brl(price):
         price = 0.0
 
-    try:
-        # 2) fallback: rota "markets" (costuma trazer mais casas)
-        if price <= 0.0 or price.is_integer():
-            r = requests.get(
-                COINGECKO_MARKETS,
-                params={"vs_currency": "brl", "ids": "the-open-network"},
-                timeout=10,
-            )
-            r.raise_for_status()
-            data = r.json()
-            if isinstance(data, list) and data:
-                price = float(data[0]["current_price"])
-    except Exception:
-        pass
+    # 2) CoinGecko markets (fallback)
+    if price <= 0.0:
+        price = _try_with_retries(_cg_markets_brl)
+        if not _is_sane_brl(price):
+            price = 0.0
 
-    # guarda no cache (mesmo que tenha vindo 0, para evitar loop agressivo)
-    _ton_price_cache["price"] = price
-    _ton_price_cache["ts"] = now
-    return price
+    # 3) Corretoras + câmbio (fallback final)
+    if price <= 0.0:
+        price = _try_with_retries(_ton_brl_from_usdt_paths)
+        if not _is_sane_brl(price):
+            price = 0.0
+
+    # Atualiza cache só se for válido
+    if price > 0.0:
+        _TON_CACHE["price"] = price
+        _TON_CACHE["ts"] = now
+
+    # devolve SEMPRE o último válido (nunca 0)
+    return _TON_CACHE["price"]
+
+
+# opcional: intervalo do pré-fetch (segundos)
+PRICE_REFRESH_SECONDS = int(os.getenv("PRICE_REFRESH_SECONDS", "45"))
+
+async def _refresh_price_loop():
+    """Mantém o cache do preço aquecido para evitar R$0.00 e reduzir latência."""
+    while True:
+        try:
+            _ = get_ton_price_brl()  # força atualizar/validar cache
+        except Exception:
+            pass  # nunca derruba o loop por erro da API
+        await asyncio.sleep(PRICE_REFRESH_SECONDS)
+
 
 
 # ========= CONFIG ==========
@@ -222,28 +328,6 @@ def verify_cryptopay_signature(body_bytes: bytes, signature_hex: str, token: str
         return (signature_hex or "").lower() == calc.lower()
     except Exception:
         return False
-
-def get_ton_brl() -> float:
-    """
-    Busca o preço da Toncoin (TON) em BRL no CoinGecko.
-    Retorna um float. Se der erro, usa fallback do .env (FALLBACK_TON_BRL) ou 18.0.
-    """
-    try:
-        r = requests.get(
-            "https://api.coingecko.com/api/v3/simple/price",
-            params={"ids": "the-open-network", "vs_currencies": "brl"},
-            headers={"Accept": "application/json", "User-Agent": "fazenda-ton-bot"},
-            timeout=10,
-        )
-        r.raise_for_status()
-        data = r.json()
-        price = float(data["the-open-network"]["brl"])
-        return price
-    except Exception as e:
-        # log opcional para debug:
-        print(f"[preco] usando fallback: {e}")
-        return float(os.getenv("FALLBACK_TON_BRL", "18.0"))
-
 
 
 # ========= WEBHOOK CRYPTO PAY ==========
@@ -858,6 +942,9 @@ def start_bot():
 async def on_startup():
     await bot.delete_webhook(drop_pending_updates=True)
     start_bot()
+    # inicia o pré-fetch do preço (não bloqueia o app)
+    asyncio.create_task(_refresh_price_loop())
+
 
 # ========== FASTAPI MAIN ==========
 if __name__ == '__main__':
