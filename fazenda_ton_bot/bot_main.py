@@ -5,12 +5,40 @@ from datetime import datetime
 import hashlib
 import hmac
 import requests
+import time
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 
 from fastapi import FastAPI, Request
 import uvicorn
+
+
+# ===== Preço do TON em BRL (CoinGecko) =====
+_TON_CACHE = {"ts": 0.0, "price": 17.0}  # fallback inicial
+
+def get_ton_price_brl() -> float:
+    """
+    Busca 1 TON em BRL na CoinGecko com cache de 60s.
+    Em caso de erro, retorna o último valor em cache.
+    """
+    now = time.time()
+    # usa cache por até 60 segundos
+    if (now - _TON_CACHE["ts"] < 60) and _TON_CACHE["price"]:
+        return float(_TON_CACHE["price"])
+
+    url = "https://api.coingecko.com/api/v3/simple/price?ids=toncoin&vs_currencies=brl"
+    try:
+        r = requests.get(url, timeout=6)
+        r.raise_for_status()
+        price = float(r.json()["toncoin"]["brl"])
+        _TON_CACHE["ts"] = now
+        _TON_CACHE["price"] = price
+        return price
+    except Exception:
+        # Em erro, devolve o último cache (ou 17.0 na primeira vez)
+        return float(_TON_CACHE["price"])
+
 
 # ========= CONFIG ==========
 # Telegram
