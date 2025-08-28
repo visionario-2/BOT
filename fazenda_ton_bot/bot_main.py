@@ -174,6 +174,27 @@ def verify_cryptopay_signature(body_bytes: bytes, signature_hex: str, token: str
     except Exception:
         return False
 
+def get_ton_price_brl() -> float:
+    """
+    Retorna o preço do TON em BRL (CoinGecko).
+    Tem fallback para variável de ambiente TON_PRICE_BRL_OVERRIDE
+    e, por último, um valor padrão 18.0.
+    """
+    try:
+        r = requests.get(
+            "https://api.coingecko.com/api/v3/simple/price",
+            params={"ids": "toncoin", "vs_currencies": "brl"},
+            timeout=10
+        )
+        data = r.json()
+        return float(data["toncoin"]["brl"])
+    except Exception:
+        try:
+            return float(os.getenv("TON_PRICE_BRL_OVERRIDE", "18.0"))
+        except Exception:
+            return 18.0
+
+
 # ========= WEBHOOK CRYPTO PAY ==========
 @app.post("/webhook/cryptopay")
 async def cryptopay_webhook(request: Request):
@@ -504,20 +525,115 @@ async def gerar_link_custom(msg: types.Message):
 @dp.message(lambda msg: msg.text == "🔄 Trocar cash por TON")
 async def trocar_cash(msg: types.Message):
     user_id = msg.from_user.id
-    cur.execute("SELECT COALESCE(saldo_cash,0), COALESCE(saldo_ton,0) FROM usuarios WHERE telegram_id=?", (user_id,))
-    saldo_cash, saldo_ton = cur.fetchone()
-    if saldo_cash < 1000:
-        await msg.answer("Você precisa de pelo menos 1000 cash para trocar por TON.\nCada 1000 cash = 1 TON")
+    row = cur.execute(
+        "SELECT COALESCE(saldo_cash,0), COALESCE(saldo_ton,0) FROM usuarios WHERE telegram_id=?",
+        (user_id,)
+    ).fetchone()
+    saldo_cash, saldo_ton = row if row else (0, 0)
+
+    preco_brl = get_ton_price_brl()
+    cash_por_ton = max(1, int(round(preco_brl * CASH_POR_REAL)))  # ex.: 18.50 * 100 = 1850
+
+    texto = (
+        "💱 *Troca cash → TON*\n"
+        f"Preço atual (CoinGecko): `1 TON ≈ R$ {preco_brl:.2f}`\n"
+        f"Equivalência: `1 TON ≈ {cash_por_ton} cash` (1 real = {CASH_POR_REAL:.0f} cash)\n\n"
+        "Envie a quantidade que deseja converter usando os botões abaixo (mín. `20` cash)\n"
+        "_Ou digite: `trocar 250`_"
+    )
+
+    kb = types.InlineKeyboardMarkup(inline_keyboard=[
+        [
+            types.InlineKeyboardButton(text="20 cash", callback_data="swap:20"),
+            types.InlineKeyboardButton(text="50", callback_data="swap:50"),
+            types.InlineKeyboardButton(text="100", callback_data="swap:100"),
+        ],
+        [
+            types.InlineKeyboardButton(text="500", callback_data="swap:500"),
+            types.InlineKeyboardButton(text="Tudo", callback_data="swap:all"),
+        ]
+    ])
+    await msg.answer(texto, parse_mode="Markdown", reply_markup=kb)
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("swap:"))
+async def swap_cb(call: types.CallbackQuery):
+    user_id = call.from_user.id
+    row = cur.execute(
+        "SELECT COALESCE(saldo_cash,0), COALESCE(saldo_ton,0) FROM usuarios WHERE telegram_id=?",
+        (user_id,)
+    ).fetchone()
+    saldo_cash, saldo_ton = row if row else (0, 0)
+
+    preco_brl = get_ton_price_brl()
+    cash_por_ton = max(1, int(round(preco_brl * CASH_POR_REAL)))
+
+    _, amount_s = call.data.split(":", 1)
+    amount = saldo_cash if amount_s == "all" else int(amount_s)
+
+    if amount < 20:
+        await call.answer("Mínimo 20 cash.", show_alert=True)
         return
-    ton_adicionado = int(saldo_cash // 1000)
-    novo_cash = saldo_cash % 1000
-    novo_ton = saldo_ton + ton_adicionado
-    cur.execute("UPDATE usuarios SET saldo_cash=?, saldo_ton=? WHERE telegram_id=?", (novo_cash, novo_ton, user_id))
+    if amount > saldo_cash:
+        await call.answer("Saldo insuficiente.", show_alert=True)
+        return
+
+    ton_out = amount / cash_por_ton  # quantidade de TON
+    cur.execute(
+        "UPDATE usuarios SET saldo_cash=saldo_cash-?, saldo_ton=saldo_ton+? WHERE telegram_id=?",
+        (amount, ton_out, user_id)
+    )
     con.commit()
-    await msg.answer(
-        f"🔄 Troca realizada!\nAgora você tem `{novo_cash:.0f}` cash e `{novo_ton:.4f}` TON.\n(Use o menu principal para sacar)",
+
+    await call.message.answer(
+        f"✅ Convertidos `{amount}` cash → `{ton_out:.5f}` TON\n"
+        f"`1 TON = {cash_por_ton} cash` (≈ R$ {preco_brl:.2f}).",
         parse_mode="Markdown"
     )
+    await call.answer()
+
+
+
+@dp.message(lambda m: m.text and m.text.lower().startswith("trocar "))
+async def trocar_texto(msg: types.Message):
+    # espera formato: "trocar 250"
+    try:
+        parts = msg.text.strip().split()
+        amount = int(parts[1])
+    except Exception:
+        await msg.answer("Formato: `trocar 250` (mín. 20 cash)", parse_mode="Markdown")
+        return
+
+    user_id = msg.from_user.id
+    row = cur.execute(
+        "SELECT COALESCE(saldo_cash,0), COALESCE(saldo_ton,0) FROM usuarios WHERE telegram_id=?",
+        (user_id,)
+    ).fetchone()
+    saldo_cash, saldo_ton = row if row else (0, 0)
+
+    if amount < 20:
+        await msg.answer("Mínimo 20 cash.")
+        return
+    if amount > saldo_cash:
+        await msg.answer("Saldo insuficiente.")
+        return
+
+    preco_brl = get_ton_price_brl()
+    cash_por_ton = max(1, int(round(preco_brl * CASH_POR_REAL)))
+    ton_out = amount / cash_por_ton
+
+    cur.execute(
+        "UPDATE usuarios SET saldo_cash=saldo_cash-?, saldo_ton=saldo_ton+? WHERE telegram_id=?",
+        (amount, ton_out, user_id)
+    )
+    con.commit()
+
+    await msg.answer(
+        f"✅ Convertidos `{amount}` cash → `{ton_out:.5f}` TON\n"
+        f"`1 TON = {cash_por_ton} cash` (≈ R$ {preco_brl:.2f}).",
+        parse_mode="Markdown"
+    )
+
+
 
 @dp.message(lambda msg: msg.text == "🏦 Sacar")
 async def sacar(msg: types.Message):
