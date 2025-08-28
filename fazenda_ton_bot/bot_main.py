@@ -14,30 +14,51 @@ from fastapi import FastAPI, Request
 import uvicorn
 
 
-# ===== Preço do TON em BRL (CoinGecko) =====
-_TON_CACHE = {"ts": 0.0, "price": 17.0}  # fallback inicial
+# --- COINGECKO: preço do TON em BRL com precisão + fallback ---
+COINGECKO_SIMPLE = "https://api.coingecko.com/api/v3/simple/price"
+COINGECKO_MARKETS = "https://api.coingecko.com/api/v3/coins/markets"
+
+CACHE_SECONDS = 60
+_ton_price_cache = {"price": 0.0, "ts": 0.0}
 
 def get_ton_price_brl() -> float:
-    """
-    Busca 1 TON em BRL na CoinGecko com cache de 60s.
-    Em caso de erro, retorna o último valor em cache.
-    """
+    """Retorna preço do TON em BRL com cache de 60s e boa precisão."""
     now = time.time()
-    # usa cache por até 60 segundos
-    if (now - _TON_CACHE["ts"] < 60) and _TON_CACHE["price"]:
-        return float(_TON_CACHE["price"])
+    if now - _ton_price_cache["ts"] < CACHE_SECONDS and _ton_price_cache["price"] > 0:
+        return _ton_price_cache["price"]
 
-    url = "https://api.coingecko.com/api/v3/simple/price?ids=toncoin&vs_currencies=brl"
+    price = 0.0
     try:
-        r = requests.get(url, timeout=6)
+        # 1) tenta rota "simple" pedindo precisão completa
+        r = requests.get(
+            COINGECKO_SIMPLE,
+            params={"ids": "the-open-network", "vs_currencies": "brl", "precision": "full"},
+            timeout=10,
+        )
         r.raise_for_status()
-        price = float(r.json()["toncoin"]["brl"])
-        _TON_CACHE["ts"] = now
-        _TON_CACHE["price"] = price
-        return price
+        price = float(r.json()["the-open-network"]["brl"])
     except Exception:
-        # Em erro, devolve o último cache (ou 17.0 na primeira vez)
-        return float(_TON_CACHE["price"])
+        price = 0.0
+
+    try:
+        # 2) fallback: rota "markets" (costuma trazer mais casas)
+        if price <= 0.0 or price.is_integer():
+            r = requests.get(
+                COINGECKO_MARKETS,
+                params={"vs_currency": "brl", "ids": "the-open-network"},
+                timeout=10,
+            )
+            r.raise_for_status()
+            data = r.json()
+            if isinstance(data, list) and data:
+                price = float(data[0]["current_price"])
+    except Exception:
+        pass
+
+    # guarda no cache (mesmo que tenha vindo 0, para evitar loop agressivo)
+    _ton_price_cache["price"] = price
+    _ton_price_cache["ts"] = now
+    return price
 
 
 # ========= CONFIG ==========
