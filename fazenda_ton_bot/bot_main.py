@@ -32,6 +32,10 @@ CRYPTOPAY_API = "https://pay.crypt.bot/api"
 # Conversão simples: 1 real = X cash
 CASH_POR_REAL = float(os.getenv("CASH_POR_REAL", "100"))
 
+# Indicações – % que o indicador recebe sobre cada depósito do indicado
+REF_PCT = float(os.getenv("REF_PCT", "4"))   # ex.: 4 = 4%
+
+
 # ========= DB ==========
 con = sqlite3.connect(DB_PATH, check_same_thread=False)
 cur = con.cursor()
@@ -60,6 +64,15 @@ def init_db():
         PRIMARY KEY (telegram_id, animal)
     )''')
 
+
+    # Relação de quem indicou quem
+    cur.execute('''CREATE TABLE IF NOT EXISTS indicacoes (
+        quem INTEGER PRIMARY KEY,   -- id do novo usuário
+        por  INTEGER,               -- id do indicador
+        criado_em TEXT
+    )''')
+
+    
     # Evitar crédito duplicado de depósitos
     cur.execute('''CREATE TABLE IF NOT EXISTS pagamentos (
         invoice_id TEXT PRIMARY KEY,
@@ -182,10 +195,9 @@ async def cryptopay_webhook(request: Request):
     except Exception:
         reais = 0.0
 
-    CASH_POR_REAL = int(os.getenv("CASH_POR_REAL", "100"))
     cash = int(round(reais * CASH_POR_REAL))
 
-    # ---- anti-duplicação: só processa se conseguir inserir a invoice ----
+    # anti-duplicação
     try:
         cur.execute(
             "INSERT INTO pagamentos (invoice_id, user_id, valor_reais, cash, criado_em) "
@@ -197,6 +209,7 @@ async def cryptopay_webhook(request: Request):
         return {"ok": True}  # já processada
 
     if cash > 0:
+        # 1) credita o pagador
         cur.execute(
             "UPDATE usuarios SET saldo_cash = saldo_cash + ? WHERE telegram_id = ?",
             (cash, user_id)
@@ -210,7 +223,33 @@ async def cryptopay_webhook(request: Request):
         except Exception:
             pass
 
+        try:
+            row_ref = cur.execute(
+                "SELECT por FROM indicacoes WHERE quem=?",
+                (user_id,)
+            ).fetchone()
+            if row_ref:
+                indicador_id = row_ref[0]
+                ref_cash = int(round(cash * REF_PCT / 100))
+                if ref_cash > 0:
+                    cur.execute(
+                        "UPDATE usuarios SET saldo_cash = saldo_cash + ? WHERE telegram_id=?",
+                        (ref_cash, indicador_id)
+                    )
+                    con.commit()
+                    try:
+                        await bot.send_message(
+                            indicador_id,
+                            f"🎁 Bônus de indicação: +{ref_cash} cash pelo depósito do seu indicado."
+                        )
+                    except Exception:
+                        pass
+        except Exception:
+            # qualquer erro aqui não bloqueia o depósito principal
+            pass
+
     return {"ok": True}
+
 
 
 # ========= UI / MENUS ==========
@@ -241,6 +280,19 @@ async def start(msg: types.Message):
         (user_id, datetime.now().isoformat()))
     con.commit()
 
+    # Se veio com payload /start <indicador>, registra a indicação (uma vez)
+    parts = (msg.text or "").split()
+    ref_id = None
+    if len(parts) >= 2 and parts[0] == '/start' and parts[1].isdigit():
+        ref_id = int(parts[1])
+    if ref_id and ref_id != user_id:
+        cur.execute(
+            "INSERT OR IGNORE INTO indicacoes (quem, por, criado_em) VALUES (?, ?, ?)",
+            (user_id, ref_id, datetime.now().isoformat())
+        )
+        con.commit()
+
+    
     cur.execute("SELECT saldo_cash, saldo_ton FROM usuarios WHERE telegram_id=?", (user_id,))
     saldo_cash, saldo_ton = cur.fetchone() or (0, 0)
 
@@ -451,8 +503,24 @@ async def sacar(msg: types.Message):
 @dp.message(lambda msg: msg.text == "👫 Indique & Ganhe")
 async def indicacao(msg: types.Message):
     user_id = msg.from_user.id
-    link = f"https://t.me/seu_bot?start={user_id}"
-    await msg.answer(f"Convide amigos com este link e ganhe bônus:\n{link}")
+
+    # conta quantos usuários você indicou
+    row = cur.execute("SELECT COUNT(*) FROM indicacoes WHERE por=?", (user_id,)).fetchone()
+    indicacoes = row[0] if row and row[0] is not None else 0
+
+    # pega o @username do bot para montar o link correto
+    me = await bot.get_me()
+    username = me.username or "seu_bot"  # fallback se não tiver username
+    link = f"https://t.me/{username}?start={user_id}"
+
+    texto = (
+        f"🎉 *Indique & Ganhe*\n\n"
+        f"Convide amigos e receba *{REF_PCT:.0f}%* de cada depósito que eles fizerem!\n"
+        f"🔗 Seu link: {link}\n\n"
+        f"👥 *Indicações:* `{indicacoes}`"
+    )
+    await msg.answer(texto, parse_mode="Markdown")
+
 
 @dp.message(lambda msg: msg.text == "❓ Ajuda/Suporte")
 async def ajuda(msg: types.Message):
