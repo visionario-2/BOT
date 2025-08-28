@@ -215,6 +215,14 @@ async def cryptopay_webhook(request: Request):
 
 # ========= UI / MENUS ==========
 def menu():
+
+    def kb_voltar():
+    return types.ReplyKeyboardMarkup(
+        keyboard=[[types.KeyboardButton(text="⬅️ Voltar")]],
+        resize_keyboard=True
+    )
+
+    
     return types.ReplyKeyboardMarkup(
         keyboard=[
             [types.KeyboardButton(text="🐾 Meus Animais"), types.KeyboardButton(text="💰 Meu Saldo")],
@@ -231,29 +239,32 @@ async def start(msg: types.Message):
     user_id = msg.from_user.id
     cur.execute(
         "INSERT OR IGNORE INTO usuarios (telegram_id, criado_em) VALUES (?, ?)",
-        (user_id, datetime.now().isoformat())
-    )
+        (user_id, datetime.now().isoformat()))
     con.commit()
 
-    cur.execute("SELECT COALESCE(saldo_cash,0), COALESCE(saldo_ton,0) FROM usuarios WHERE telegram_id=?", (user_id,))
-    row = cur.fetchone()
-    saldo_cash, saldo_ton = row if row else (0, 0)
+    cur.execute("SELECT saldo_cash, saldo_ton FROM usuarios WHERE telegram_id=?", (user_id,))
+    saldo_cash, saldo_ton = cur.fetchone() or (0, 0)
 
     cur.execute("SELECT SUM(quantidade) FROM inventario WHERE telegram_id=?", (user_id,))
     total_animais = cur.fetchone()[0] or 0
 
-    cur.execute("""SELECT SUM(quantidade * rendimento)
-                   FROM inventario JOIN animais ON inventario.animal = animais.nome
-                   WHERE inventario.telegram_id=?""", (user_id,))
+    cur.execute("""
+        SELECT SUM(quantidade * rendimento)
+        FROM inventario JOIN animais ON inventario.animal = animais.nome
+        WHERE inventario.telegram_id=?
+    """, (user_id,))
     rendimento_dia = cur.fetchone()[0] or 0
 
     texto = (
-        f"🌾 *Bem-vindo à Fazenda TON!*\n\n"
-        f"💸 Cash: `{saldo_cash:.0f}` | 💎 TON: `{saldo_ton:.4f}`\n"
-        f"🐾 Animais: `{total_animais}` | 📈 Rendimento/dia: `{rendimento_dia:.2f} cash`\n\n"
+        "🌾 *Bem-vindo à Fazenda TON!*\n\n"
+        f"💸 Cash: `{saldo_cash:.0f}`\n"
+        f"💎 TON: `{saldo_ton:.4f}`\n"
+        f"🐾 Animais: `{total_animais}`\n"
+        f"📈 Rendimento/dia: `{rendimento_dia:.2f}` cash\n\n"
         "Escolha uma opção:"
     )
     await msg.answer(texto, reply_markup=menu(), parse_mode="Markdown")
+
 
 @dp.message(lambda msg: msg.text == "💰 Meu Saldo")
 async def saldo(msg: types.Message):
@@ -270,46 +281,62 @@ async def saldo(msg: types.Message):
 
 @dp.message(lambda msg: msg.text == "🛒 Comprar")
 async def comprar(msg: types.Message):
-    cur.execute("SELECT nome, preco, rendimento, emoji FROM animais")
-    animais = cur.fetchall()
-    texto = "*Escolha o animal para comprar:*\n\n"
-    keyboard = []
-    for nome, preco, rendimento, emoji in animais:
-        texto += f"{emoji} {nome} — `{preco} cash` | Rende `{rendimento} cash/dia`\n"
-        keyboard.append([types.KeyboardButton(text=f"{emoji} Comprar {nome}")])
-    keyboard.append([types.KeyboardButton(text="⬅️ Voltar")])
-    await msg.answer(
-        texto,
-        reply_markup=types.ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True),
-        parse_mode="Markdown"
-    )
+    # mostra só o botão Voltar no teclado de baixo
+    await msg.answer("Escolha um animal para comprar:", reply_markup=kb_voltar())
 
-@dp.message(lambda msg: msg.text and msg.text.startswith(tuple(['🐔','🐖','🐄','🐂','🐑','🐇','🐐','🐎'])) and "Comprar" in msg.text)
-async def comprar_animal(msg: types.Message):
-    user_id = msg.from_user.id
-    nome = msg.text.split("Comprar ", 1)[1]
-    cur.execute("SELECT preco FROM animais WHERE nome=?", (nome,))
+    cur.execute("SELECT nome, preco, rendimento, emoji FROM animais ORDER BY preco ASC")
+    for nome, preco, rendimento, emoji in cur.fetchall():
+        card = (
+            f"{emoji} *{nome}*\n"
+            f"💵 Preço: `{preco}` cash\n"
+            f"📈 Rende: `{rendimento}` cash/dia"
+        )
+        kb_inline = types.InlineKeyboardMarkup(inline_keyboard=[[
+            types.InlineKeyboardButton(
+                text=f"Comprar {emoji}",
+                callback_data=f"buy:{nome}"
+            )
+        ]])
+        await msg.answer(card, reply_markup=kb_inline, parse_mode="Markdown")
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("buy:"))
+async def comprar_animal_cb(call: types.CallbackQuery):
+    nome = call.data.split("buy:", 1)[1]
+    user_id = call.from_user.id
+
+    cur.execute("SELECT preco, rendimento, emoji FROM animais WHERE nome=?", (nome,))
     r = cur.fetchone()
     if not r:
-        await msg.answer("Animal não encontrado.")
+        await call.answer("Animal não encontrado.", show_alert=True)
         return
-    preco = r[0]
+    preco, rendimento, emoji = r
 
-    cur.execute("SELECT COALESCE(saldo_cash,0) FROM usuarios WHERE telegram_id=?", (user_id,))
+    cur.execute("SELECT saldo_cash FROM usuarios WHERE telegram_id=?", (user_id,))
     row = cur.fetchone()
-    saldo = row[0] if row else 0  # corrigido: não chamar fetchone() duas vezes
+    saldo = row[0] if row else 0
 
     if saldo < preco:
-        await msg.answer("❌ Saldo insuficiente.")
+        await call.message.answer(f"⚠️ Cash insuficientes para comprar {emoji}!")
+        await call.answer("Saldo insuficiente", show_alert=False)
         return
 
+    # Debita e adiciona ao inventário
     cur.execute("UPDATE usuarios SET saldo_cash=saldo_cash-? WHERE telegram_id=?", (preco, user_id))
-    cur.execute("INSERT OR IGNORE INTO inventario (telegram_id, animal, quantidade, ultima_coleta) VALUES (?, ?, 0, ?)",
-                (user_id, nome, datetime.now().isoformat()))
-    cur.execute("UPDATE inventario SET quantidade=quantidade+1, ultima_coleta=? WHERE telegram_id=? AND animal=?",
-                (datetime.now().isoformat(), user_id, nome))
+    agora = datetime.now().isoformat()
+    cur.execute(
+        "INSERT OR IGNORE INTO inventario (telegram_id, animal, quantidade, ultima_coleta) VALUES (?, ?, 0, ?)",
+        (user_id, nome, agora)
+    )
+    cur.execute(
+        "UPDATE inventario SET quantidade=quantidade+1, ultima_coleta=? WHERE telegram_id=? AND animal=?",
+        (agora, user_id, nome)
+    )
     con.commit()
-    await msg.answer(f"Parabéns! Você comprou um(a) {nome} 🎉", reply_markup=menu())
+
+    await call.message.answer(f"✅ Você comprou com sucesso {emoji}!")
+    await call.answer()  # confirma o clique
+
+
 
 @dp.message(lambda msg: msg.text == "⬅️ Voltar")
 async def voltar(msg: types.Message):
