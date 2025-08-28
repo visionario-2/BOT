@@ -174,25 +174,27 @@ def verify_cryptopay_signature(body_bytes: bytes, signature_hex: str, token: str
     except Exception:
         return False
 
-def get_ton_price_brl() -> float:
+def get_ton_brl() -> float:
     """
-    Retorna o preço do TON em BRL (CoinGecko).
-    Tem fallback para variável de ambiente TON_PRICE_BRL_OVERRIDE
-    e, por último, um valor padrão 18.0.
+    Busca o preço da Toncoin (TON) em BRL no CoinGecko.
+    Retorna um float. Se der erro, usa fallback do .env (FALLBACK_TON_BRL) ou 18.0.
     """
     try:
         r = requests.get(
             "https://api.coingecko.com/api/v3/simple/price",
-            params={"ids": "toncoin", "vs_currencies": "brl"},
-            timeout=10
+            params={"ids": "the-open-network", "vs_currencies": "brl"},
+            headers={"Accept": "application/json", "User-Agent": "fazenda-ton-bot"},
+            timeout=10,
         )
+        r.raise_for_status()
         data = r.json()
-        return float(data["toncoin"]["brl"])
-    except Exception:
-        try:
-            return float(os.getenv("TON_PRICE_BRL_OVERRIDE", "18.0"))
-        except Exception:
-            return 18.0
+        price = float(data["the-open-network"]["brl"])
+        return price
+    except Exception as e:
+        # log opcional para debug:
+        print(f"[preco] usando fallback: {e}")
+        return float(os.getenv("FALLBACK_TON_BRL", "18.0"))
+
 
 
 # ========= WEBHOOK CRYPTO PAY ==========
