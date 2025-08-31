@@ -941,7 +941,7 @@ async def pedir_wallet(msg: types.Message, state: FSMContext):
         )
         await state.set_state(WalletStates.waiting_wallet)
 
-@dp.callback_query(F.data == "alterar_wallet"))
+@dp.callback_query_handler(lambda c: c.data == "alterar_wallet")
 async def alterar_wallet_cb(cb: types.CallbackQuery, state: FSMContext):
     await cb.message.edit_text("Envie o **novo endereço de carteira TON** para saque.", parse_mode="Markdown")
     await state.set_state(WalletStates.changing_wallet)
