@@ -193,34 +193,7 @@ def _column_exists(conn, table, column):
     cur = conn.execute(f"PRAGMA table_info({table})")
     return any(r[1] == column for r in cur.fetchall())
 
-def ensure_schema():
-    conn = sqlite3.connect(DB_PATH)
-    try:
-        if not _column_exists(conn, "usuarios", "carteira_ton"):
-            conn.execute("ALTER TABLE usuarios ADD COLUMN carteira_ton TEXT")
-        if not _column_exists(conn, "usuarios", "saldo_cash"):
-            conn.execute("ALTER TABLE usuarios ADD COLUMN saldo_cash REAL DEFAULT 0.0")
-        if not _column_exists(conn, "usuarios", "saldo_cash_pagamentos"):
-            conn.execute("ALTER TABLE usuarios ADD COLUMN saldo_cash_pagamentos REAL DEFAULT 0.0")
-        if not _column_exists(conn, "usuarios", "saldo_ton"):
-            conn.execute("ALTER TABLE usuarios ADD COLUMN saldo_ton REAL DEFAULT 0.0")
 
-
-        conn.execute("""
-        CREATE TABLE IF NOT EXISTS withdrawals (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          user_id INTEGER NOT NULL,
-          requested_ton REAL NOT NULL,
-          wallet TEXT NOT NULL,
-          status TEXT NOT NULL CHECK(status IN ('pending','processing','done','failed')) DEFAULT 'pending',
-          idempotency_key TEXT UNIQUE NOT NULL,
-          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-        """)
-        conn.commit()
-    finally:
-        conn.close()
 
 # >>> CHAMAR A FUNÇÃO NO STARTUP <<<
 ensure_schema()
@@ -314,6 +287,36 @@ def cadastrar_animais():
 
 init_db()
 cadastrar_animais()
+
+def ensure_schema():
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        if not _column_exists(conn, "usuarios", "carteira_ton"):
+            conn.execute("ALTER TABLE usuarios ADD COLUMN carteira_ton TEXT")
+        if not _column_exists(conn, "usuarios", "saldo_cash"):
+            conn.execute("ALTER TABLE usuarios ADD COLUMN saldo_cash REAL DEFAULT 0.0")
+        if not _column_exists(conn, "usuarios", "saldo_cash_pagamentos"):
+            conn.execute("ALTER TABLE usuarios ADD COLUMN saldo_cash_pagamentos REAL DEFAULT 0.0")
+        if not _column_exists(conn, "usuarios", "saldo_ton"):
+            conn.execute("ALTER TABLE usuarios ADD COLUMN saldo_ton REAL DEFAULT 0.0")
+
+
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS withdrawals (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id INTEGER NOT NULL,
+          requested_ton REAL NOT NULL,
+          wallet TEXT NOT NULL,
+          status TEXT NOT NULL CHECK(status IN ('pending','processing','done','failed')) DEFAULT 'pending',
+          idempotency_key TEXT UNIQUE NOT NULL,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """)
+        conn.commit()
+    finally:
+        conn.close()
+
 
 # ========= BOT ==========
 bot = Bot(token=TOKEN)
@@ -919,11 +922,11 @@ async def trocar_texto(msg: types.Message):
     )
 
 
-from aiogram.filters import Text
 
-@dp.message(Text("🏦 Sacar"))
+@dp.message(F.text == "🏦 Sacar")
 async def sacar_menu(msg: types.Message):
     await msg.answer("Escolha uma opção de saque:", reply_markup=sacar_keyboard())
+
 
 @dp.message(Text("Wallet TON"))
 async def pedir_wallet(msg: types.Message, state: FSMContext):
@@ -941,7 +944,7 @@ async def pedir_wallet(msg: types.Message, state: FSMContext):
         )
         await state.set_state(WalletStates.waiting_wallet)
 
-@dp.callback_query_handler(lambda c: c.data == "alterar_wallet")
+@dp.callback_query(F.data == "alterar_wallet")
 async def alterar_wallet_cb(cb: types.CallbackQuery, state: FSMContext):
     await cb.message.edit_text("Envie o **novo endereço de carteira TON** para saque.", parse_mode="Markdown")
     await state.set_state(WalletStates.changing_wallet)
