@@ -1,14 +1,19 @@
 import asyncio
-import sqlite3
 from datetime import datetime
 import hashlib
 import hmac
-import os
-import time
 import requests
+import httpx
+from aiogram import F, types
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.fsm.state import StatesGroup, State
+from aiogram.fsm.context import FSMContext
+import re, uuid, time, os, sqlite3
 
 
-from aiogram import Bot, Dispatcher, types
+
+
+from aiogram import Bot, Dispatcher
 from aiogram.filters import Command
 
 from fastapi import FastAPI, Request
@@ -180,7 +185,46 @@ PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")  # ex: https://seu-servico.on
 BOT_USERNAME = os.getenv("BOT_USERNAME", "SEU_BOT_USERNAME")  # ex.: "bot_kjp7"
 
 # Banco de Dados
-DB_PATH = os.getenv("DB_PATH", "fazenda.db")
+
+# === MIGRAÇÃO LEVE (roda no startup) ===
+DB_PATH = os.getenv("DB_PATH", "db.sqlite3")  # se você já tem DB_PATH, mantenha só UMA definição
+
+def _column_exists(conn, table, column):
+    cur = conn.execute(f"PRAGMA table_info({table})")
+    return any(r[1] == column for r in cur.fetchall())
+
+def ensure_schema():
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        if not _column_exists(conn, "usuarios", "carteira_ton"):
+            conn.execute("ALTER TABLE usuarios ADD COLUMN carteira_ton TEXT")
+        if not _column_exists(conn, "usuarios", "saldo_cash"):
+            conn.execute("ALTER TABLE usuarios ADD COLUMN saldo_cash REAL DEFAULT 0.0")
+        if not _column_exists(conn, "usuarios", "saldo_cash_pagamentos"):
+            conn.execute("ALTER TABLE usuarios ADD COLUMN saldo_cash_pagamentos REAL DEFAULT 0.0")
+        if not _column_exists(conn, "usuarios", "saldo_ton"):
+            conn.execute("ALTER TABLE usuarios ADD COLUMN saldo_ton REAL DEFAULT 0.0")
+
+
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS withdrawals (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id INTEGER NOT NULL,
+          requested_ton REAL NOT NULL,
+          wallet TEXT NOT NULL,
+          status TEXT NOT NULL CHECK(status IN ('pending','processing','done','failed')) DEFAULT 'pending',
+          idempotency_key TEXT UNIQUE NOT NULL,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """)
+        conn.commit()
+    finally:
+        conn.close()
+
+# >>> CHAMAR A FUNÇÃO NO STARTUP <<<
+ensure_schema()
+
 
 # Crypto Pay (https://t.me/CryptoBot -> Crypto Pay -> Create App)
 CRYPTOPAY_TOKEN = os.getenv("CRYPTOPAY_TOKEN")
@@ -315,6 +359,112 @@ def criar_invoice_cryptopay(user_id: int, valor_reais: float) -> str:
     }
     inv = cryptopay_call("createInvoice", payload)  # objeto Invoice
     return inv.get("bot_invoice_url") or inv.get("pay_url")
+
+# === TECLADOS / BOTÕES ===
+def sacar_keyboard():
+    kb = ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.add(KeyboardButton("Wallet TON"), KeyboardButton("Pagamento"))
+    return kb
+
+def alterar_wallet_inline():
+    return InlineKeyboardMarkup().add(
+        InlineKeyboardButton(text="Alterar Wallet", callback_data="alterar_wallet")
+    )
+
+# === STATES (FSM) ===
+class WalletStates(StatesGroup):
+    waiting_wallet = State()
+    changing_wallet = State()
+
+class WithdrawStates(StatesGroup):
+    waiting_amount_ton = State()
+
+# === UTILS ===
+WALLET_RE = re.compile(r'^[UE]Q[A-Za-z0-9_-]{45,}$')
+
+def is_valid_ton_wallet(addr: str) -> bool:
+    addr = addr.strip()
+    return bool(WALLET_RE.match(addr))
+
+def new_idempotency_key(user_id: int) -> str:
+    return f"wd-{user_id}-{int(time.time())}-{uuid.uuid4().hex[:8]}"
+
+# === DB HELPERS ===
+def db_conn():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def set_wallet(user_id: int, wallet: str):
+    with db_conn() as c:
+        c.execute("UPDATE usuarios SET carteira_ton=? WHERE telegram_id=?", (wallet, user_id))
+
+def get_wallet(user_id: int):
+    with db_conn() as c:
+        r = c.execute("SELECT carteira_ton FROM usuarios WHERE telegram_id=?", (user_id,)).fetchone()
+        return r["carteira_ton"] if r and r["carteira_ton"] else None
+
+def get_balances(user_id: int):
+    with db_conn() as c:
+        r = c.execute("SELECT saldo_cash, saldo_cash_pagamentos, saldo_ton FROM usuarios WHERE telegram_id=?", (user_id,)).fetchone()
+        if not r: return 0.0, 0.0, 0.0
+        return r["saldo_cash"], r["saldo_cash_pagamentos"], r["saldo_ton"]
+
+
+def debit_cash_payments_and_credit_ton(user_id: int, amount_ton: float, ton_brl_price: float, cash_por_real: int):
+    cash_needed = amount_ton * ton_brl_price * cash_por_real
+    with db_conn() as c:
+        row = c.execute("SELECT saldo_cash_pagamentos, saldo_ton FROM usuarios WHERE telegram_id=?", (user_id,)).fetchone()
+        if not row:
+            raise ValueError("Usuário não encontrado.")
+        if row["saldo_cash_pagamentos"] + 1e-9 < cash_needed:
+            raise ValueError("Saldo de pagamentos insuficiente.")
+        c.execute("UPDATE usuarios SET saldo_cash_pagamentos=saldo_cash_pagamentos-?, saldo_ton=saldo_ton+? WHERE telegram_id=?",
+          (cash_needed, amount_ton, user_id))
+
+def create_withdraw(user_id: int, requested_ton: float, wallet: str, idemp: str):
+    with db_conn() as c:
+        c.execute("""INSERT INTO withdrawals (user_id, requested_ton, wallet, status, idempotency_key)
+                     VALUES (?,?,?,?,?)""", (user_id, requested_ton, wallet, 'pending', idemp))
+        return c.execute("SELECT last_insert_rowid() id").fetchone()["id"]
+
+def set_withdraw_status(wid: int, status: str):
+    with db_conn() as c:
+        c.execute("UPDATE withdrawals SET status=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                  (status, wid))
+
+
+class CryptoPayError(Exception):
+    pass
+
+async def cryptopay_transfer_ton_to_address(amount_ton: float, ton_address: str, idempotency_key: str):
+    headers = {
+        "Crypto-Pay-API-Token": CRYPTOPAY_TOKEN,
+        "Idempotency-Key": idempotency_key
+    }
+    payload = {"asset": "TON", "amount": str(amount_ton), "address": ton_address}
+    async with httpx.AsyncClient(timeout=30) as cli:
+        r = await cli.post("https://pay.crypt.bot/api/createPayout", headers=headers, json=payload)
+        data = r.json() if r.headers.get("content-type","").startswith("application/json") else {"ok": False, "description": r.text}
+        if r.status_code != 200 or not data.get("ok"):
+            raise CryptoPayError(f"createPayout falhou: {data}")
+        return data["result"]
+
+# Alternativa: transferir para o usuário do CryptoBot (se você usa user_id do CryptoBot)
+async def cryptopay_transfer_ton_to_user(amount_ton: float, crypto_user_id: int, idempotency_key: str):
+    headers = {
+        "Crypto-Pay-API-Token": CRYPTOPAY_TOKEN,
+        "Idempotency-Key": idempotency_key
+    }
+    payload = {"asset": "TON", "amount": str(amount_ton), "user_id": crypto_user_id}
+    async with httpx.AsyncClient(timeout=30) as cli:
+        r = await cli.post("https://pay.crypt.bot/api/transfer", headers=headers, json=payload)
+        data = r.json() if r.headers.get("content-type","").startswith("application/json") else {"ok": False, "description": r.text}
+        if r.status_code != 200 or not data.get("ok"):
+            raise CryptoPayError(f"transfer falhou: {data}")
+        return data["result"]
+
+
 
 def verify_cryptopay_signature(body_bytes: bytes, signature_hex: str, token: str) -> bool:
     """
@@ -769,15 +919,113 @@ async def trocar_texto(msg: types.Message):
     )
 
 
+from aiogram.filters import Text
 
-@dp.message(lambda msg: msg.text == "🏦 Sacar")
-async def sacar(msg: types.Message):
+@dp.message(Text("🏦 Sacar"))
+async def sacar_menu(msg: types.Message):
+    await msg.answer("Escolha uma opção de saque:", reply_markup=sacar_keyboard())
+
+@dp.message(Text("Wallet TON"))
+async def pedir_wallet(msg: types.Message, state: FSMContext):
+    wal = get_wallet(msg.from_user.id)
+    if wal:
+        await msg.answer(
+            f"Carteira atual:\n`{wal}`\n\nSe quiser alterar, toque em **Alterar Wallet**.",
+            parse_mode="Markdown"
+        )
+        await msg.answer("Para alterar sua carteira TON, toque no botão abaixo.", reply_markup=alterar_wallet_inline())
+    else:
+        await msg.answer(
+            "Envie agora **seu endereço de carteira TON** para receber os saques (ex.: começa com `UQ` ou `EQ`).",
+            parse_mode="Markdown"
+        )
+        await state.set_state(WalletStates.waiting_wallet)
+
+@dp.callback_query(F.data == "alterar_wallet"))
+async def alterar_wallet_cb(cb: types.CallbackQuery, state: FSMContext):
+    await cb.message.edit_text("Envie o **novo endereço de carteira TON** para saque.", parse_mode="Markdown")
+    await state.set_state(WalletStates.changing_wallet)
+    await cb.answer()
+
+@dp.message(WalletStates.waiting_wallet)
+@dp.message(WalletStates.changing_wallet)
+async def salvar_wallet(msg: types.Message, state: FSMContext):
+    addr = msg.text.strip()
+    if not is_valid_ton_wallet(addr):
+        return await msg.answer("Endereço inválido. Certifique-se que começa com `UQ` ou `EQ` e tente novamente.")
+    set_wallet(msg.from_user.id, addr)
+    await state.clear()
+    await msg.answer(f"✅ Carteira salva:\n`{addr}`", parse_mode="Markdown", reply_markup=alterar_wallet_inline())
+
+@dp.message(Text("Pagamento"))
+async def iniciar_pagamento(msg: types.Message, state: FSMContext):
+    wal = get_wallet(msg.from_user.id)
+    if not wal:
+        return await msg.answer("Você ainda não definiu sua **Wallet TON**. Toque em *Wallet TON* e cadastre antes de sacar.", parse_mode="Markdown")
+
+    _, saldo_pag, saldo_ton = get_balances(msg.from_user.id)
     await msg.answer(
-        "Envie o valor em TON **e** a carteira TON na mesma mensagem.\n"
-        "Exemplo:\n`2.0 UQxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx`\n\n"
-        "_Dica: a carteira TON geralmente começa com `UQ` ou `EQ`._",
+        "Quanto você deseja sacar **em TON**?\n\n"
+        f"• Saldo de pagamentos (cash dos animais): {saldo_pag:.2f} cash\n"
+        f"• Saldo TON: {saldo_ton:.6f} TON\n\n"
+        "Obs.: só é permitido sacar o valor **gerado pelos animais**. No saque, converteremos do *cash de pagamentos* para TON.",
         parse_mode="Markdown"
     )
+    await state.set_state(WithdrawStates.waiting_amount_ton)
+
+@dp.message_handler(state=WithdrawStates.waiting_amount_ton)
+async def processar_saque(msg: types.Message, state: FSMContext):
+    try:
+        amount_ton = float(msg.text.replace(",", "."))
+        if amount_ton <= 0:
+            return await msg.answer("Valor inválido. Envie um número maior que zero.")
+    except:
+        return await msg.answer("Não entendi. Envie apenas o **número** (ex.: 1.25).")
+
+    wallet = get_wallet(msg.from_user.id)
+    if not wallet:
+        await state.clear()
+        return await msg.answer("Wallet não encontrada. Cadastre sua **Wallet TON** e tente novamente.")
+
+    # preço TON e parâmetro de conversão:
+    ton_brl = get_ton_price_brl()
+    CASH_POR_REAL = int(os.getenv("CASH_POR_REAL", "100"))
+
+    # converte do cash_pagamentos -> ton (debitando cash_pagamentos)
+    try:
+        debit_cash_payments_and_credit_ton(
+            user_id=msg.from_user.id,
+            amount_ton=amount_ton,
+            ton_brl_price=ton_brl,
+            cash_por_real=CASH_POR_REAL
+        )
+    except Exception as e:
+        await state.clear()
+        return await msg.answer(f"Saldo insuficiente nos **pagamentos** para converter {amount_ton:.6f} TON. ({e})")
+
+    idemp = new_idempotency_key(msg.from_user.id)
+    wid = create_withdraw(msg.from_user.id, requested_ton=amount_ton, wallet=wallet, idemp=idemp)
+    set_withdraw_status(wid, "processing")
+    await msg.answer("⏳ Processando seu saque…")
+
+    try:
+        # tente payout para ENDEREÇO (se seu app tiver)
+        await cryptopay_transfer_ton_to_address(amount_ton, wallet, idemp)
+        set_withdraw_status(wid, "done")
+        await msg.answer(f"✅ Saque enviado!\nValor: {amount_ton:.6f} TON\nCarteira: `{wallet}`", parse_mode="Markdown")
+
+    except Exception as e:
+        # estorno da conversão (volta pro cash_pagamentos) para não prejudicar o usuário
+        with db_conn() as c:
+            c.execute(
+                "UPDATE usuarios SET saldo_cash_pagamentos = saldo_cash_pagamentos + (? * ? * ?), saldo_ton = saldo_ton - ? WHERE telegram_id=?",
+        (amount_ton, ton_brl, CASH_POR_REAL, amount_ton, msg.from_user.id)
+    )
+        set_withdraw_status(wid, "failed")
+        await msg.answer("❌ Não foi possível completar o saque agora (payout indisponível). O valor foi estornado para seu saldo de pagamentos. Tente novamente mais tarde.")
+    finally:
+        await state.clear()
+
 
 
 @dp.message(lambda msg: msg.text == "👫 Indique & Ganhe")
@@ -813,126 +1061,7 @@ async def ajuda(msg: types.Message):
         "Qualquer dúvida, fale conosco!"
     )
 
-# Heurística: mensagem com número + espaço + endereço TON (evita conflitar com depósito custom)
-@dp.message(lambda m: m.text and len(m.text.strip().split()) >= 2 and m.text.strip().split()[0].replace('.', '', 1).isdigit())
-async def processa_saque(msg: types.Message):
-    partes = msg.text.strip().split()
-    try:
-        valor = float(partes[0])
-        carteira = partes[1]
-    except Exception:
-        await msg.answer("Formato inválido. Envie: `VALOR CARTEIRA_TON`", parse_mode="Markdown")
-        return
 
-    # validações simples
-    if valor <= 0:
-        await msg.answer("Valor inválido.")
-        return
-    if not (carteira.startswith("UQ") or carteira.startswith("EQ")) or len(carteira) < 36:
-        await msg.answer("Carteira TON aparentemente inválida. Verifique e envie novamente.")
-        return
-
-    user_id = msg.from_user.id
-    cur.execute("SELECT saldo_ton FROM usuarios WHERE telegram_id=?", (user_id,))
-    r = cur.fetchone()
-    saldo = r[0] if r else 0.0
-
-    if saldo < valor:
-        await msg.answer(f"Saldo insuficiente. Seu saldo TON é `{saldo:.4f}`.", parse_mode="Markdown")
-        return
-
-    # Reserva: debita já para não gastar duas vezes
-    cur.execute("UPDATE usuarios SET saldo_ton = saldo_ton - ? WHERE telegram_id=?", (valor, user_id))
-    cur.execute(
-        "INSERT INTO saques (telegram_id, valor_ton, carteira, status, criado_em) VALUES (?, ?, ?, 'pendente', ?)",
-        (user_id, valor, carteira, datetime.now().isoformat())
-    )
-    saque_id = cur.lastrowid
-    con.commit()
-
-    await msg.answer(
-        f"✅ Pedido de saque **#{saque_id}** criado.\n"
-        f"Valor: `{valor:.4f}` TON\nCarteira: `{carteira}`\n\n"
-        f"Acompanhe com `/meussaques`.",
-        parse_mode="Markdown"
-    )
-
-    # avisa o admin
-    if OWNER_ID:
-        try:
-            await bot.send_message(
-                OWNER_ID,
-                f"🔔 Novo saque pendente #{saque_id}\nUser {user_id}\n{valor:.4f} TON → {carteira}"
-            )
-        except Exception:
-            pass
-
-
-@dp.message(Command("meussaques"))
-async def meus_saques(msg: types.Message):
-    rows = cur.execute(
-        "SELECT id, valor_ton, carteira, status, criado_em, IFNULL(pago_em, '') "
-        "FROM saques WHERE telegram_id=? ORDER BY id DESC LIMIT 10",
-        (msg.from_user.id,)
-    ).fetchall()
-    if not rows:
-        await msg.answer("Você ainda não tem pedidos de saque.")
-        return
-
-    linhas = []
-    for (sid, val, cart, status, criado, pago) in rows:
-        quando = (criado or "").split("T")[0]
-        extra = f" • pago em {(pago or '').split('T')[0]}" if (pago or "").strip() else ""
-        linhas.append(f"#{sid} • {val:.4f} TON • {status}{extra}")
-    await msg.answer("🧾 *Seus últimos saques:*\n" + "\n".join(linhas), parse_mode="Markdown")
-
-
-@dp.message(Command("adm_saques"))
-async def adm_saques(msg: types.Message):
-    if not is_admin(msg.from_user.id):
-        return
-    rows = cur.execute(
-        "SELECT id, telegram_id, valor_ton, carteira, criado_em "
-        "FROM saques WHERE status='pendente' ORDER BY id"
-    ).fetchall()
-    if not rows:
-        await msg.answer("Sem saques pendentes.")
-        return
-    linhas = [f"#{sid} • user {uid} • {val:.4f} TON • {carteira}" for (sid, uid, val, carteira, _) in rows]
-    await msg.answer(
-        "⏳ *Pendentes:*\n" + "\n".join(linhas) + "\n\nMarcar pago: `/pagar ID`",
-        parse_mode="Markdown"
-    )
-
-@dp.message(Command("pagar"))
-async def pagar_cmd(msg: types.Message):
-    if not is_admin(msg.from_user.id):
-        return
-    p = msg.text.strip().split()
-    if len(p) != 2 or not p[1].isdigit():
-        await msg.answer("Use: `/pagar ID`", parse_mode="Markdown")
-        return
-    sid = int(p[1])
-    row = cur.execute(
-        "SELECT telegram_id, valor_ton, carteira, status FROM saques WHERE id=?",
-        (sid,)
-    ).fetchone()
-    if not row:
-        await msg.answer("ID não encontrado.")
-        return
-    uid, val, cart, status = row
-    if status != "pendente":
-        await msg.answer("Esse saque não está pendente.")
-        return
-
-    cur.execute("UPDATE saques SET status='pago', pago_em=? WHERE id=?", (datetime.now().isoformat(), sid))
-    con.commit()
-    await msg.answer(f"✅ Saque #{sid} marcado como *PAGO*.", parse_mode="Markdown")
-
-    try:
-        await bot.send_message(uid, f"✅ Seu saque #{sid} foi enviado.\nValor: {val:.4f} TON\nCarteira: {cart}")
-    except Exception:
-        pass
 
 # ========= INICIAR BOT ==========
 def start_bot():
