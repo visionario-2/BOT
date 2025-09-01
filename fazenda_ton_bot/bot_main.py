@@ -11,6 +11,7 @@ from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMar
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
+from aiogram.utils.keyboard import ReplyKeyboardBuilder  # <-- import do builder
 
 from fastapi import FastAPI, Request
 import uvicorn
@@ -306,9 +307,12 @@ def criar_invoice_cryptopay(user_id: int, valor_reais: float) -> str:
 
 # === TECLADOS / BOTÕES ===
 def sacar_keyboard():
-    kb = ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add(KeyboardButton("Wallet TON"), KeyboardButton("Pagamento"))
-    return kb
+    # --- Opção 2: ReplyKeyboardBuilder (v3) ---
+    kb = ReplyKeyboardBuilder()
+    kb.button(text="Wallet TON")
+    kb.button(text="Pagamento")
+    kb.adjust(2)  # duas colunas
+    return kb.as_markup(resize_keyboard=True)
 
 def alterar_wallet_inline():
     return InlineKeyboardMarkup().add(
@@ -961,7 +965,7 @@ async def ajuda(msg: types.Message):
     )
 
 
-# ========= INICIAR BOT ==========
+# ========= INICIAR BOT =========
 def start_bot():
     asyncio.create_task(dp.start_polling(bot))
 
