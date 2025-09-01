@@ -436,6 +436,51 @@ def verify_cryptopay_signature(body_bytes: bytes, signature_hex: str, token: str
         return False
 
 
+# ========= RENDIMENTO / COLETA MANUAL =========
+DAY_SECS = 86400.0
+
+def _rows_animais_user(user_id: int):
+    with db_conn() as c:
+        return c.execute(
+            """SELECT i.quantidade, i.ultima_coleta, a.rendimento, a.nome, a.emoji
+               FROM inventario i
+               JOIN animais a ON a.nome = i.animal
+               WHERE i.telegram_id=?""",
+            (user_id,)
+        ).fetchall()
+
+def compute_pending_cash(user_id: int) -> float:
+    """Quanto o usuário tem acumulado (não coletado) em cash."""
+    rows = _rows_animais_user(user_id)
+    now_ts = time.time()
+    total = 0.0
+    for r in rows:
+        qtd = r["quantidade"] or 0
+        rend = float(r["rendimento"] or 0.0)
+        last = r["ultima_coleta"] or datetime.now().isoformat()
+        try:
+            last_ts = datetime.fromisoformat(last).timestamp()
+        except Exception:
+            last_ts = now_ts
+        elapsed = max(0.0, now_ts - last_ts)
+        total += rend * qtd * (elapsed / DAY_SECS)
+    return round(total, 2)
+
+def collect_pending_cash(user_id: int) -> float:
+    """Credita o acumulado no saldo de pagamentos e atualiza ultima_coleta para agora."""
+    amount = compute_pending_cash(user_id)
+    if amount <= 0:
+        return 0.0
+    now_iso = datetime.now().isoformat()
+    with db_conn() as c:
+        c.execute(
+            "UPDATE usuarios SET saldo_cash_pagamentos=COALESCE(saldo_cash_pagamentos,0)+? WHERE telegram_id=?",
+            (amount, user_id)
+        )
+        c.execute("UPDATE inventario SET ultima_coleta=? WHERE telegram_id=?", (now_iso, user_id))
+    return amount
+
+
 # ========= WEBHOOK CRYPTO PAY =========
 @app.post("/webhook/cryptopay")
 async def cryptopay_webhook(request: Request):
@@ -568,10 +613,15 @@ async def start(msg: types.Message):
         )
         con.commit()
 
-    cur.execute("SELECT saldo_cash, saldo_ton FROM usuarios WHERE telegram_id=?", (user_id,))
+    # saldos
+    cur.execute(
+        "SELECT COALESCE(saldo_cash,0), COALESCE(saldo_cash_pagamentos,0), COALESCE(saldo_ton,0) "
+        "FROM usuarios WHERE telegram_id=?", (user_id,)
+    )
     row = cur.fetchone()
-    saldo_cash, saldo_ton = row if row else (0, 0)
+    saldo_cash, saldo_pag, saldo_ton = row if row else (0, 0, 0)
 
+    # inventário e rendimento
     cur.execute("SELECT SUM(quantidade) FROM inventario WHERE telegram_id=?", (user_id,))
     total_animais = cur.fetchone()[0] or 0
 
@@ -584,7 +634,8 @@ async def start(msg: types.Message):
 
     texto = (
         "🌾 *Bem-vindo à Fazenda TON!*\n\n"
-        f"💸 Cash: `{saldo_cash:.0f}`\n"
+        f"💵 Cash (depósitos): `{saldo_cash:.0f}`\n"
+        f"🧺 Cash (pagamentos): `{saldo_pag:.2f}`\n"
         f"💎 TON: `{saldo_ton:.4f}`\n"
         f"🐾 Animais: `{total_animais}`\n"
         f"📈 Rendimento/dia: `{rendimento_dia:.2f}` cash\n\n"
@@ -596,13 +647,16 @@ async def start(msg: types.Message):
 @dp.message(F.text == "💰 Meu Saldo")
 async def saldo(msg: types.Message):
     user_id = msg.from_user.id
-    cur.execute("SELECT COALESCE(saldo_cash,0), COALESCE(saldo_ton,0) FROM usuarios WHERE telegram_id=?", (user_id,))
-    row = cur.fetchone()
-    saldo_cash, saldo_ton = row if row else (0, 0)
+    row = cur.execute(
+        "SELECT COALESCE(saldo_cash,0), COALESCE(saldo_cash_pagamentos,0), COALESCE(saldo_ton,0) "
+        "FROM usuarios WHERE telegram_id=?", (user_id,)
+    ).fetchone()
+    saldo_cash, saldo_pag, saldo_ton = row if row else (0, 0, 0)
     await msg.answer(
-        f"💸 Seu saldo em cash: `{saldo_cash:.0f}`\n"
-        f"💎 Seu saldo em TON: `{saldo_ton:.4f}`\n"
-        f"Conversão (depósito): 1 real = {CASH_POR_REAL:.0f} cash",
+        "💼 *Seus saldos:*\n"
+        f"• Cash (depósitos): `{saldo_cash:.0f}`\n"
+        f"• Cash (pagamentos): `{saldo_pag:.2f}`\n"
+        f"• TON: `{saldo_ton:.4f}`",
         parse_mode="Markdown"
     )
 
@@ -670,15 +724,47 @@ async def meus_animais(msg: types.Message):
     if not itens:
         await msg.answer("Você ainda não possui animais. Compre um na loja!")
         return
+
     resposta = "🐾 *Seus Animais:*\n\n"
-    total_rendimento = 0
+    total_rendimento = 0.0
     for animal, qtd in itens:
         cur.execute("SELECT rendimento, emoji FROM animais WHERE nome=?", (animal,))
         rendimento, emoji = cur.fetchone()
         resposta += f"{emoji} {animal}: `{qtd}` | Rendimento: `{rendimento * qtd:.1f} cash/dia`\n"
         total_rendimento += rendimento * qtd
-    resposta += f"\n📈 *Total rendimento/dia:* `{total_rendimento:.1f} cash`"
-    await msg.answer(resposta, parse_mode="Markdown")
+
+    coletavel = compute_pending_cash(user_id)
+    resposta += (
+        f"\n📈 *Total rendimento/dia:* `{total_rendimento:.1f} cash`"
+        f"\n🧺 *Coletável agora:* `{coletavel:.2f} cash`"
+    )
+
+    kb = types.InlineKeyboardMarkup(inline_keyboard=[[
+        types.InlineKeyboardButton(text=f"Coletar rendimento ({coletavel:.2f})", callback_data="collect_now")
+    ]])
+
+    await msg.answer(resposta, parse_mode="Markdown", reply_markup=kb)
+
+@dp.callback_query(F.data == "collect_now")
+async def collect_now_cb(call: types.CallbackQuery):
+    user_id = call.from_user.id
+    amount = collect_pending_cash(user_id)
+    if amount <= 0:
+        await call.answer("Nada para coletar agora.", show_alert=True)
+        return
+
+    row = cur.execute(
+        "SELECT COALESCE(saldo_cash,0), COALESCE(saldo_cash_pagamentos,0), COALESCE(saldo_ton,0) "
+        "FROM usuarios WHERE telegram_id=?", (user_id,)
+    ).fetchone()
+    saldo_cash, saldo_pag, saldo_ton = row if row else (0, 0, 0)
+
+    await call.message.answer(
+        f"✅ Coleta realizada: `+{amount:.2f}` cash em *pagamentos*.\n"
+        f"🧺 Saldo (pagamentos) agora: `{saldo_pag:.2f}`",
+        parse_mode="Markdown"
+    )
+    await call.answer()
 
 
 # ===== Depósito via Crypto Pay (BRL) =====
