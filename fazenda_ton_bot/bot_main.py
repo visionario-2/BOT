@@ -867,12 +867,9 @@ async def pedir_wallet(msg: types.Message, state: FSMContext):
             parse_mode="Markdown"
         )
         await msg.answer(
-    "Para alterar sua carteira TON, toque no botão abaixo.",
-    reply_markup=alterar_wallet_inline()
-)
-# opcional: dar também o teclado de Voltar no chat principal
-await msg.answer("Use os botões abaixo para navegar.", reply_markup=kb_voltar())
-
+            "Para alterar sua carteira TON, toque no botão abaixo.",
+            reply_markup=alterar_wallet_inline()
+        )
     else:
         await msg.answer(
             "Envie agora **seu endereço de carteira TON** para receber os saques (ex.: começa com `UQ` ou `EQ`).",
@@ -880,6 +877,12 @@ await msg.answer("Use os botões abaixo para navegar.", reply_markup=kb_voltar()
             reply_markup=kb_voltar()
         )
         await state.set_state(WalletStates.waiting_wallet)
+
+
+
+# opcional: dar também o teclado de Voltar no chat principal
+await msg.answer("Use os botões abaixo para navegar.", reply_markup=kb_voltar())
+
 
 @dp.callback_query(F.data == "alterar_wallet")
 async def alterar_wallet_cb(cb: types.CallbackQuery, state: FSMContext):
