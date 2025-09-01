@@ -315,11 +315,12 @@ def ensure_user(user_id: int):
 def sacar_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton("Wallet TON"), KeyboardButton("Pagamento")],
-            [KeyboardButton("⬅️ Voltar")]
+            [KeyboardButton(text="Wallet TON"), KeyboardButton(text="Pagamento")],
+            [KeyboardButton(text="⬅️ Voltar")]
         ],
         resize_keyboard=True
     )
+
 
 def alterar_wallet_inline():
     return InlineKeyboardMarkup(
