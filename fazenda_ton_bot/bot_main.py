@@ -146,7 +146,8 @@ PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "SEU_BOT_USERNAME")
 
 # ========= DB ==========
-DB_PATH = os.getenv("DB_PATH", "db.sqlite3")
+DB_PATH = os.getenv("DB_PATH", "/data/db.sqlite3")
+print("DB_PATH em uso:", DB_PATH)
 
 def _column_exists(conn, table, column):
     cur = conn.execute(f"PRAGMA table_info({table})")
@@ -345,6 +346,10 @@ WALLET_RE = re.compile(r'^[UE]Q[A-Za-z0-9_-]{45,}$')
 def is_valid_ton_wallet(addr: str) -> bool:
     addr = addr.strip()
     return bool(WALLET_RE.match(addr))
+
+def normalize_wallet(addr: str) -> str:
+    return re.sub(r'\s+', '', addr.strip())
+
 
 def new_idempotency_key(user_id: int) -> str:
     return f"wd-{user_id}-{int(time.time())}-{uuid.uuid4().hex[:8]}"
@@ -861,7 +866,13 @@ async def pedir_wallet(msg: types.Message, state: FSMContext):
             f"Carteira atual:\n`{wal}`\n\nSe quiser alterar, toque em **Alterar Wallet**.",
             parse_mode="Markdown"
         )
-        await msg.answer("Para alterar sua carteira TON, toque no botão abaixo.", reply_markup=alterar_wallet_inline())
+        await msg.answer(
+    "Para alterar sua carteira TON, toque no botão abaixo.",
+    reply_markup=alterar_wallet_inline()
+)
+# opcional: dar também o teclado de Voltar no chat principal
+await msg.answer("Use os botões abaixo para navegar.", reply_markup=kb_voltar())
+
     else:
         await msg.answer(
             "Envie agora **seu endereço de carteira TON** para receber os saques (ex.: começa com `UQ` ou `EQ`).",
@@ -878,31 +889,56 @@ async def alterar_wallet_cb(cb: types.CallbackQuery, state: FSMContext):
     await state.set_state(WalletStates.changing_wallet)
     await cb.answer()
 
-@dp.message(StateFilter(WalletStates.waiting_wallet))
-@dp.message(StateFilter(WalletStates.changing_wallet))
-async def salvar_wallet(msg: types.Message, state: FSMContext):
-    addr = msg.text.strip()
-    if not is_valid_ton_wallet(addr):
-        return await msg.answer("Endereço inválido. Certifique-se que começa com `UQ` ou `EQ` e tente novamente.")
+# === atalhos quando o bot está esperando a carteira ===
 
-    with db_conn() as c:
-        c.execute("UPDATE usuarios SET carteira_ton=? WHERE telegram_id=?", (addr, msg.from_user.id))
-        c.commit()
-
-    await state.clear()
-    await msg.answer(f"✅ Carteira salva:\n`{addr}`", parse_mode="Markdown", reply_markup=alterar_wallet_inline())
-    await msg.answer("Escolha uma opção de saque:", reply_markup=sacar_keyboard())
-
-# atalhos enquanto espera wallet
+# sair do fluxo de wallet e voltar ao menu
 @dp.message(StateFilter(WalletStates.waiting_wallet), F.text == "⬅️ Voltar")
 async def cancelar_wallet(msg: types.Message, state: FSMContext):
     await state.clear()
     await msg.answer("Voltei ao menu.", reply_markup=menu())
 
+# ir para Pagamento mesmo estando no fluxo de wallet
 @dp.message(StateFilter(WalletStates.waiting_wallet), F.text == "Pagamento")
 async def atalho_pagamento(msg: types.Message, state: FSMContext):
     await state.clear()
     return await iniciar_pagamento(msg, state)
+
+
+
+@dp.message(StateFilter(WalletStates.waiting_wallet))
+@dp.message(StateFilter(WalletStates.changing_wallet))
+async def salvar_wallet(msg: types.Message, state: FSMContext):
+    txt = (msg.text or "").strip()
+
+    # se o usuário apertar um botão enquanto estamos pedindo a carteira,
+    # não tente validar como endereço
+    if txt in {"Pagamento", "Wallet TON", "⬅️ Voltar"}:
+        # Deixe os atalhos cuidarem ou volte ao menu
+        if txt == "⬅️ Voltar":
+            await state.clear()
+            return await msg.answer("Voltei ao menu.", reply_markup=menu())
+        if txt == "Pagamento":
+            await state.clear()
+            return await iniciar_pagamento(msg, state)
+        # "Wallet TON" apenas reapresenta a instrução
+        return await msg.answer(
+            "Envie o endereço de carteira TON (começa com UQ/EQ) ou toque em ⬅️ Voltar.",
+            reply_markup=sacar_keyboard()
+        )
+
+    addr = normalize_wallet(txt
+    if not is_valid_ton_wallet(addr):
+        return await msg.answer(
+            "Endereço inválido. Certifique-se que começa com `UQ` ou `EQ` e tente novamente.",
+            parse_mode="Markdown"
+        )
+
+    set_wallet(msg.from_user.id, addr)
+    await state.clear()
+    await msg.answer(f"✅ Carteira salva:\n`{addr}`", parse_mode="Markdown", reply_markup=alterar_wallet_inline())
+    await msg.answer("Pronto! Use o menu abaixo.", reply_markup=menu())
+
+# atalhos enquanto espera wallet
 
 @dp.message(F.text == "Pagamento")
 async def iniciar_pagamento(msg: types.Message, state: FSMContext):
