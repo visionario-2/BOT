@@ -4,17 +4,13 @@ import hashlib
 import hmac
 import requests
 import httpx
-from aiogram import F, types
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.fsm.state import StatesGroup, State
-from aiogram.fsm.context import FSMContext
 import re, uuid, time, os, sqlite3
 
-
-
-
-from aiogram import Bot, Dispatcher
-from aiogram.filters import Command
+from aiogram import Bot, Dispatcher, F, types
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.filters import Command, StateFilter
+from aiogram.fsm.state import StatesGroup, State
+from aiogram.fsm.context import FSMContext
 
 from fastapi import FastAPI, Request
 import uvicorn
@@ -22,31 +18,22 @@ import uvicorn
 
 # ===== Preço do TON em BRL – robusto, com cache, retries e múltiplas fontes =====
 
-# TTL do cache (segundos)
-PRICE_CACHE_SECONDS = int(os.getenv("PRICE_CACHE_SECONDS", "60"))
-# Fallback inicial caso tudo falhe no primeiro boot
+PRICE_CACHE_SECONDS = int(os.getenv("PRICE_CACHE_SECONDS", "60"))  # TTL do cache (s)
 FALLBACK_TON_BRL = float(os.getenv("FALLBACK_TON_BRL", "17.0"))
 
-# cache do ÚLTIMO PREÇO VÁLIDO (nunca armazena 0)
 _TON_CACHE = {"price": FALLBACK_TON_BRL, "ts": 0.0}
 
-# Fontes
 COINGECKO_SIMPLE = "https://api.coingecko.com/api/v3/simple/price"
 COINGECKO_MARKETS = "https://api.coingecko.com/api/v3/coins/markets"
-
 BINANCE_TICKER = "https://api.binance.com/api/v3/ticker/price?symbol=TONUSDT"
 OKX_TICKER     = "https://www.okx.com/api/v5/market/ticker?instId=TON-USDT"
-
-# Câmbio USD/BRL (para transformar TON/USDT -> BRL; USDT ~ USD)
 FX_USD_BRL_1 = "https://open.er-api.com/v6/latest/USD"
 FX_USD_BRL_2 = "https://api.exchangerate.host/latest?base=USD&symbols=BRL"
 
 def _is_sane_brl(p: float) -> bool:
-    # rejeita valores absurds (ajuste se quiser)
     return 0.1 <= p <= 1000.0
 
 def _try_with_retries(fn, attempts=(0.0, 0.5, 1.0)):
-    """Tenta chamar fn() com pequenos backoffs. Retorna float (>0) ou 0."""
     for delay in attempts:
         try:
             v = float(fn())
@@ -86,131 +73,86 @@ def _okx_ton_usdt():
     r = requests.get(OKX_TICKER, timeout=10)
     r.raise_for_status()
     data = r.json()
-    # OKX retorna {"data":[{"last":"1.234"}],...}
     return float(data["data"][0]["last"]) if "data" in data and data["data"] else 0.0
 
 def _usd_brl_rate():
-    # tenta 2 fontes simples, com retries
     def _fx1():
         r = requests.get(FX_USD_BRL_1, timeout=10)
         r.raise_for_status()
         return float(r.json()["rates"]["BRL"])
-
     def _fx2():
         r = requests.get(FX_USD_BRL_2, timeout=10)
         r.raise_for_status()
         return float(r.json()["rates"]["BRL"])
-
     rate = _try_with_retries(_fx1)
     if rate <= 0:
         rate = _try_with_retries(_fx2)
     return rate
 
 def _ton_brl_from_usdt_paths():
-    """Pega TON/USDT em corretoras e converte usando USD->BRL."""
     usdt_price = _try_with_retries(_binance_ton_usdt)
     if usdt_price <= 0:
         usdt_price = _try_with_retries(_okx_ton_usdt)
     if usdt_price <= 0:
         return 0.0
-
     usd_brl = _try_with_retries(_usd_brl_rate)
     if usd_brl <= 0:
         return 0.0
-
     return usdt_price * usd_brl
 
 def get_ton_price_brl() -> float:
-    """
-    Retorna o preço do TON em BRL:
-      - cache por PRICE_CACHE_SECONDS
-      - CoinGecko (2 rotas) com retries
-      - fallback via corretoras (TON/USDT) * USD/BRL
-      - NUNCA retorna 0; se falhar tudo, devolve último válido do cache
-    """
     now = time.time()
     if (now - _TON_CACHE["ts"] < PRICE_CACHE_SECONDS) and _TON_CACHE["price"] > 0:
         return _TON_CACHE["price"]
 
-    # 1) CoinGecko simple
     price = _try_with_retries(_cg_simple_brl)
     if not _is_sane_brl(price):
         price = 0.0
 
-    # 2) CoinGecko markets (fallback)
     if price <= 0.0:
         price = _try_with_retries(_cg_markets_brl)
         if not _is_sane_brl(price):
             price = 0.0
 
-    # 3) Corretoras + câmbio (fallback final)
     if price <= 0.0:
         price = _try_with_retries(_ton_brl_from_usdt_paths)
         if not _is_sane_brl(price):
             price = 0.0
 
-    # Atualiza cache só se for válido
     if price > 0.0:
         _TON_CACHE["price"] = price
         _TON_CACHE["ts"] = now
 
-    # devolve SEMPRE o último válido (nunca 0)
     return _TON_CACHE["price"]
 
-
-# opcional: intervalo do pré-fetch (segundos)
 PRICE_REFRESH_SECONDS = int(os.getenv("PRICE_REFRESH_SECONDS", "45"))
 
 async def _refresh_price_loop():
-    """Mantém o cache do preço aquecido para evitar R$0.00 e reduzir latência."""
     while True:
         try:
-            _ = get_ton_price_brl()  # força atualizar/validar cache
+            _ = get_ton_price_brl()
         except Exception:
-            pass  # nunca derruba o loop por erro da API
+            pass
         await asyncio.sleep(PRICE_REFRESH_SECONDS)
 
 
-
 # ========= CONFIG ==========
-# Telegram
-TOKEN = os.getenv('TOKEN')  # token do bot do Telegram
+TOKEN = os.getenv('TOKEN')
 OWNER_ID = int(os.getenv("OWNER_TELEGRAM_ID", "0"))
 def is_admin(uid: int) -> bool:
     return OWNER_ID and uid == OWNER_ID
 
-# App público (URL do Render depois do 1º deploy)
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")  # ex: https://seu-servico.onrender.com
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")
+BOT_USERNAME = os.getenv("BOT_USERNAME", "SEU_BOT_USERNAME")
 
-BOT_USERNAME = os.getenv("BOT_USERNAME", "SEU_BOT_USERNAME")  # ex.: "bot_kjp7"
-
-# Banco de Dados
-
-# === MIGRAÇÃO LEVE (roda no startup) ===
-DB_PATH = os.getenv("DB_PATH", "db.sqlite3")  # se você já tem DB_PATH, mantenha só UMA definição
+# ========= DB ==========
+DB_PATH = os.getenv("DB_PATH", "db.sqlite3")
 
 def _column_exists(conn, table, column):
     cur = conn.execute(f"PRAGMA table_info({table})")
     return any(r[1] == column for r in cur.fetchall())
 
-
-
-# >>> CHAMAR A FUNÇÃO NO STARTUP <<<
-ensure_schema()
-
-
-# Crypto Pay (https://t.me/CryptoBot -> Crypto Pay -> Create App)
-CRYPTOPAY_TOKEN = os.getenv("CRYPTOPAY_TOKEN")
-CRYPTOPAY_API = "https://pay.crypt.bot/api"
-
-# Conversão simples: 1 real = X cash
-CASH_POR_REAL = float(os.getenv("CASH_POR_REAL", "100"))
-
-# Indicações – % que o indicador recebe sobre cada depósito do indicado
-REF_PCT = float(os.getenv("REF_PCT", "4"))   # ex.: 4 = 4%
-
-
-# ========= DB ==========
+# conexão global usada por partes do código
 con = sqlite3.connect(DB_PATH, check_same_thread=False)
 cur = con.cursor()
 
@@ -238,16 +180,12 @@ def init_db():
         PRIMARY KEY (telegram_id, animal)
     )''')
 
-
-    # Relação de quem indicou quem
     cur.execute('''CREATE TABLE IF NOT EXISTS indicacoes (
-        quem INTEGER PRIMARY KEY,   -- id do novo usuário
-        por  INTEGER,               -- id do indicador
+        quem INTEGER PRIMARY KEY,
+        por  INTEGER,
         criado_em TEXT
     )''')
 
-    
-    # Evitar crédito duplicado de depósitos
     cur.execute('''CREATE TABLE IF NOT EXISTS pagamentos (
         invoice_id TEXT PRIMARY KEY,
         user_id INTEGER,
@@ -258,19 +196,17 @@ def init_db():
     cur.execute('''CREATE UNIQUE INDEX IF NOT EXISTS idx_pagamentos_invoice
                    ON pagamentos(invoice_id)''')
 
-    # Fila de saques
     cur.execute('''CREATE TABLE IF NOT EXISTS saques (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         telegram_id INTEGER,
         valor_ton REAL,
         carteira TEXT,
-        status TEXT DEFAULT 'pendente',   -- pendente | pago | cancelado
+        status TEXT DEFAULT 'pendente',
         criado_em TEXT,
         pago_em TEXT
     )''')
 
     con.commit()
-
 
 def cadastrar_animais():
     animais = [
@@ -285,9 +221,6 @@ def cadastrar_animais():
             (nome, preco, rendimento, emoji))
     con.commit()
 
-init_db()
-cadastrar_animais()
-
 def ensure_schema():
     conn = sqlite3.connect(DB_PATH)
     try:
@@ -299,7 +232,6 @@ def ensure_schema():
             conn.execute("ALTER TABLE usuarios ADD COLUMN saldo_cash_pagamentos REAL DEFAULT 0.0")
         if not _column_exists(conn, "usuarios", "saldo_ton"):
             conn.execute("ALTER TABLE usuarios ADD COLUMN saldo_ton REAL DEFAULT 0.0")
-
 
         conn.execute("""
         CREATE TABLE IF NOT EXISTS withdrawals (
@@ -317,12 +249,24 @@ def ensure_schema():
     finally:
         conn.close()
 
+# cria tudo primeiro, depois prossegue
+init_db()
+cadastrar_animais()
+ensure_schema()
 
-# ========= BOT ==========
+
+# ========= CRYPTO PAY ==========
+CRYPTOPAY_TOKEN = os.getenv("CRYPTOPAY_TOKEN")
+CRYPTOPAY_API = "https://pay.crypt.bot/api"
+
+CASH_POR_REAL = int(os.getenv("CASH_POR_REAL", "100"))   # use inteiro aqui
+REF_PCT = float(os.getenv("REF_PCT", "4"))
+
+
+# ========= BOT / APP ==========
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-# ========= FASTAPI ==========
 app = FastAPI()
 
 @app.get("/")
@@ -333,9 +277,9 @@ async def root():
 async def healthz():
     return {"ok": True}
 
+
 # ========= CRYPTO PAY HELPERS ==========
 def cryptopay_call(method: str, payload: dict):
-    """Chama a API do Crypto Pay. Lança erro se vier ok=False."""
     r = requests.post(
         f"{CRYPTOPAY_API}/{method}",
         json=payload,
@@ -348,20 +292,17 @@ def cryptopay_call(method: str, payload: dict):
     return data["result"]
 
 def criar_invoice_cryptopay(user_id: int, valor_reais: float) -> str:
-    """
-    Cria uma invoice FIAT (BRL) com aceitação de USDT e TON.
-    Retorna a URL para o usuário pagar (bot_invoice_url).
-    """
     payload = {
         "currency_type": "fiat",
         "fiat": "BRL",
         "amount": f"{valor_reais:.2f}",
         "accepted_assets": "USDT,TON",
-        "payload": str(user_id),            # será retornado no webhook
+        "payload": str(user_id),
         "description": "Depósito Fazendinha"
     }
-    inv = cryptopay_call("createInvoice", payload)  # objeto Invoice
+    inv = cryptopay_call("createInvoice", payload)
     return inv.get("bot_invoice_url") or inv.get("pay_url")
+
 
 # === TECLADOS / BOTÕES ===
 def sacar_keyboard():
@@ -374,6 +315,7 @@ def alterar_wallet_inline():
         InlineKeyboardButton(text="Alterar Wallet", callback_data="alterar_wallet")
     )
 
+
 # === STATES (FSM) ===
 class WalletStates(StatesGroup):
     waiting_wallet = State()
@@ -381,6 +323,7 @@ class WalletStates(StatesGroup):
 
 class WithdrawStates(StatesGroup):
     waiting_amount_ton = State()
+
 
 # === UTILS ===
 WALLET_RE = re.compile(r'^[UE]Q[A-Za-z0-9_-]{45,}$')
@@ -392,7 +335,6 @@ def is_valid_ton_wallet(addr: str) -> bool:
 def new_idempotency_key(user_id: int) -> str:
     return f"wd-{user_id}-{int(time.time())}-{uuid.uuid4().hex[:8]}"
 
-# === DB HELPERS ===
 def db_conn():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -413,7 +355,6 @@ def get_balances(user_id: int):
         if not r: return 0.0, 0.0, 0.0
         return r["saldo_cash"], r["saldo_cash_pagamentos"], r["saldo_ton"]
 
-
 def debit_cash_payments_and_credit_ton(user_id: int, amount_ton: float, ton_brl_price: float, cash_por_real: int):
     cash_needed = amount_ton * ton_brl_price * cash_por_real
     with db_conn() as c:
@@ -422,8 +363,10 @@ def debit_cash_payments_and_credit_ton(user_id: int, amount_ton: float, ton_brl_
             raise ValueError("Usuário não encontrado.")
         if row["saldo_cash_pagamentos"] + 1e-9 < cash_needed:
             raise ValueError("Saldo de pagamentos insuficiente.")
-        c.execute("UPDATE usuarios SET saldo_cash_pagamentos=saldo_cash_pagamentos-?, saldo_ton=saldo_ton+? WHERE telegram_id=?",
-          (cash_needed, amount_ton, user_id))
+        c.execute(
+            "UPDATE usuarios SET saldo_cash_pagamentos=saldo_cash_pagamentos-?, saldo_ton=saldo_ton+? WHERE telegram_id=?",
+            (cash_needed, amount_ton, user_id)
+        )
 
 def create_withdraw(user_id: int, requested_ton: float, wallet: str, idemp: str):
     with db_conn() as c:
@@ -433,8 +376,7 @@ def create_withdraw(user_id: int, requested_ton: float, wallet: str, idemp: str)
 
 def set_withdraw_status(wid: int, status: str):
     with db_conn() as c:
-        c.execute("UPDATE withdrawals SET status=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                  (status, wid))
+        c.execute("UPDATE withdrawals SET status=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", (status, wid))
 
 
 class CryptoPayError(Exception):
@@ -453,7 +395,6 @@ async def cryptopay_transfer_ton_to_address(amount_ton: float, ton_address: str,
             raise CryptoPayError(f"createPayout falhou: {data}")
         return data["result"]
 
-# Alternativa: transferir para o usuário do CryptoBot (se você usa user_id do CryptoBot)
 async def cryptopay_transfer_ton_to_user(amount_ton: float, crypto_user_id: int, idempotency_key: str):
     headers = {
         "Crypto-Pay-API-Token": CRYPTOPAY_TOKEN,
@@ -468,13 +409,7 @@ async def cryptopay_transfer_ton_to_user(amount_ton: float, crypto_user_id: int,
         return data["result"]
 
 
-
 def verify_cryptopay_signature(body_bytes: bytes, signature_hex: str, token: str) -> bool:
-    """
-    Verifica assinatura do webhook do Crypto Pay.
-    Assinatura = HMAC-SHA256(body) com secret = SHA256(token).
-    Header: crypto-pay-api-signature
-    """
     try:
         secret = hashlib.sha256(token.encode()).digest()
         calc = hmac.new(secret, body_bytes, hashlib.sha256).hexdigest()
@@ -488,21 +423,17 @@ def verify_cryptopay_signature(body_bytes: bytes, signature_hex: str, token: str
 async def cryptopay_webhook(request: Request):
     data = await request.json()
 
-    # Aceita só quando efetivamente pago
     if data.get("update_type") != "invoice_paid":
         return {"ok": True}
 
-    # --- Tenta achar o objeto da invoice em formatos diferentes ---
     payload = data.get("payload") or {}
-    inv = payload.get("invoice") or payload  # alguns webhooks vem com payload.invoice, outros direto no payload
+    inv = payload.get("invoice") or payload
 
-    # invoice_id (string)
     invoice_id = str(inv.get("invoice_id") or inv.get("id") or "").strip()
     if not invoice_id:
         print("[cryptopay] webhook sem invoice_id:", data)
         return {"ok": True}
 
-    # user_id (vem no campo payload/custom_payload que você enviou em createInvoice)
     user_id_str = str(inv.get("payload") or inv.get("custom_payload") or "").strip()
     try:
         user_id = int(user_id_str)
@@ -510,11 +441,10 @@ async def cryptopay_webhook(request: Request):
         print("[cryptopay] webhook sem user_id(payload):", data)
         return {"ok": True}
 
-    # Valor em reais: usa o primeiro que existir
     raw_reais = (
-        inv.get("price_amount") or   # fiat
+        inv.get("price_amount") or
         inv.get("fiat_amount")  or
-        inv.get("amount")       or   # alguns formatos
+        inv.get("amount")       or
         inv.get("paid_amount")  or
         0
     )
@@ -523,34 +453,28 @@ async def cryptopay_webhook(request: Request):
     except Exception:
         reais = 0.0
 
-    # Converte para cash
     cash = int(round(reais * CASH_POR_REAL))
 
-    # 1) Idempotência (se já processou esta invoice, sai)
     try:
         cur.execute(
-            "INSERT INTO pagamentos (invoice_id, user_id, valor_reais, cash, criado_em) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO pagamentos (invoice_id, user_id, valor_reais, cash, criado_em) VALUES (?,?,?,?,?)",
             (invoice_id, user_id, reais, cash, datetime.now().isoformat())
         )
         con.commit()
     except sqlite3.IntegrityError:
         return {"ok": True}
 
-    # 2) Garante que o usuário existe mesmo que nunca tenha usado /start
     cur.execute(
         "INSERT OR IGNORE INTO usuarios (telegram_id, criado_em) VALUES (?, ?)",
         (user_id, datetime.now().isoformat())
     )
 
-    # 3) Credita o depósito
     if cash > 0:
         cur.execute(
             "UPDATE usuarios SET saldo_cash = COALESCE(saldo_cash,0) + ? WHERE telegram_id=?",
             (cash, user_id)
         )
 
-    # 4) Bônus de indicação (4% por padrão via REF_PCT)
     cur.execute("SELECT por FROM indicacoes WHERE quem=?", (user_id,))
     row = cur.fetchone()
     if row:
@@ -575,7 +499,6 @@ async def cryptopay_webhook(request: Request):
 
     con.commit()
 
-    # 5) Aviso ao pagador (só se teve cash>0)
     if cash > 0:
         try:
             await bot.send_message(
@@ -586,8 +509,6 @@ async def cryptopay_webhook(request: Request):
             pass
 
     return {"ok": True}
-
-
 
 
 # ========= UI / MENUS ==========
@@ -618,7 +539,6 @@ async def start(msg: types.Message):
         (user_id, datetime.now().isoformat()))
     con.commit()
 
-    # Se veio com payload /start <indicador>, registra a indicação (uma vez)
     parts = (msg.text or "").split()
     ref_id = None
     if len(parts) >= 2 and parts[0] == '/start' and parts[1].isdigit():
@@ -630,7 +550,6 @@ async def start(msg: types.Message):
         )
         con.commit()
 
-    
     cur.execute("SELECT saldo_cash, saldo_ton FROM usuarios WHERE telegram_id=?", (user_id,))
     saldo_cash, saldo_ton = cur.fetchone() or (0, 0)
 
@@ -655,7 +574,7 @@ async def start(msg: types.Message):
     await msg.answer(texto, reply_markup=menu(), parse_mode="Markdown")
 
 
-@dp.message(lambda msg: msg.text == "💰 Meu Saldo")
+@dp.message(F.text == "💰 Meu Saldo")
 async def saldo(msg: types.Message):
     user_id = msg.from_user.id
     cur.execute("SELECT COALESCE(saldo_cash,0), COALESCE(saldo_ton,0) FROM usuarios WHERE telegram_id=?", (user_id,))
@@ -668,11 +587,9 @@ async def saldo(msg: types.Message):
         parse_mode="Markdown"
     )
 
-@dp.message(lambda msg: msg.text == "🛒 Comprar")
+@dp.message(F.text == "🛒 Comprar")
 async def comprar(msg: types.Message):
-    # mostra só o botão Voltar no teclado de baixo
     await msg.answer("Escolha um animal para comprar:", reply_markup=kb_voltar())
-
     cur.execute("SELECT nome, preco, rendimento, emoji FROM animais ORDER BY preco ASC")
     for nome, preco, rendimento, emoji in cur.fetchall():
         card = (
@@ -681,14 +598,11 @@ async def comprar(msg: types.Message):
             f"📈 Rende: `{rendimento}` cash/dia"
         )
         kb_inline = types.InlineKeyboardMarkup(inline_keyboard=[[
-            types.InlineKeyboardButton(
-                text=f"Comprar {emoji}",
-                callback_data=f"buy:{nome}"
-            )
+            types.InlineKeyboardButton(text=f"Comprar {emoji}", callback_data=f"buy:{nome}")
         ]])
         await msg.answer(card, reply_markup=kb_inline, parse_mode="Markdown")
 
-@dp.callback_query(lambda c: c.data and c.data.startswith("buy:"))
+@dp.callback_query(F.data.startswith("buy:"))
 async def comprar_animal_cb(call: types.CallbackQuery):
     nome = call.data.split("buy:", 1)[1]
     user_id = call.from_user.id
@@ -709,7 +623,6 @@ async def comprar_animal_cb(call: types.CallbackQuery):
         await call.answer("Saldo insuficiente", show_alert=False)
         return
 
-    # Debita e adiciona ao inventário
     cur.execute("UPDATE usuarios SET saldo_cash=saldo_cash-? WHERE telegram_id=?", (preco, user_id))
     agora = datetime.now().isoformat()
     cur.execute(
@@ -723,15 +636,14 @@ async def comprar_animal_cb(call: types.CallbackQuery):
     con.commit()
 
     await call.message.answer(f"✅ Você comprou com sucesso {emoji}!")
-    await call.answer()  # confirma o clique
+    await call.answer()
 
 
-
-@dp.message(lambda msg: msg.text == "⬅️ Voltar")
+@dp.message(F.text == "⬅️ Voltar")
 async def voltar(msg: types.Message):
     await start(msg)
 
-@dp.message(lambda msg: msg.text == "🐾 Meus Animais")
+@dp.message(F.text == "🐾 Meus Animais")
 async def meus_animais(msg: types.Message):
     user_id = msg.from_user.id
     cur.execute("SELECT animal, quantidade FROM inventario WHERE telegram_id=?", (user_id,))
@@ -749,8 +661,9 @@ async def meus_animais(msg: types.Message):
     resposta += f"\n📈 *Total rendimento/dia:* `{total_rendimento:.1f} cash`"
     await msg.answer(resposta, parse_mode="Markdown")
 
+
 # ===== Depósito via Crypto Pay (BRL) =====
-@dp.message(lambda msg: msg.text == "➕ Depositar")
+@dp.message(F.text == "➕ Depositar")
 async def depositar_menu(msg: types.Message):
     kb = types.ReplyKeyboardMarkup(
         keyboard=[
@@ -770,7 +683,7 @@ def _parse_reais(txt: str):
     except:
         return None
 
-@dp.message(lambda msg: msg.text in ["R$ 10","R$ 25","R$ 50","R$ 100"])
+@dp.message(F.text.in_(["R$ 10","R$ 25","R$ 50","R$ 100"]))
 async def gerar_link_padrao(msg: types.Message):
     if not CRYPTOPAY_TOKEN:
         await msg.answer("Configuração de pagamento ausente. Avise o suporte.")
@@ -786,11 +699,11 @@ async def gerar_link_padrao(msg: types.Message):
         "Assim que o pagamento for confirmado, eu credito seus cash. ⏳"
     )
 
-@dp.message(lambda msg: msg.text == "Outro valor (R$)")
+@dp.message(F.text == "Outro valor (R$)")
 async def outro_valor(msg: types.Message):
     await msg.answer("Envie o valor desejado em reais. Ex.: 37,90")
 
-@dp.message(lambda msg: _parse_reais(msg.text) is not None and "R$" not in msg.text and "TON" not in msg.text)
+@dp.message(lambda m: _parse_reais(m.text) is not None and "R$" not in m.text and "TON" not in m.text)
 async def gerar_link_custom(msg: types.Message):
     if not CRYPTOPAY_TOKEN:
         await msg.answer("Configuração de pagamento ausente. Avise o suporte.")
@@ -809,8 +722,9 @@ async def gerar_link_custom(msg: types.Message):
         "Crédito automático após confirmação. ⏳"
     )
 
-# ===== trocas/saques etc. (mantive seu fluxo) =====
-@dp.message(lambda msg: msg.text == "🔄 Trocar cash por TON")
+
+# ===== Troca cash -> TON =====
+@dp.message(F.text == "🔄 Trocar cash por TON")
 async def trocar_cash(msg: types.Message):
     user_id = msg.from_user.id
     row = cur.execute(
@@ -820,7 +734,7 @@ async def trocar_cash(msg: types.Message):
     saldo_cash, saldo_ton = row if row else (0, 0)
 
     preco_brl = get_ton_price_brl()
-    cash_por_ton = max(1, int(round(preco_brl * CASH_POR_REAL)))  # ex.: 18.50 * 100 = 1850
+    cash_por_ton = max(1, int(round(preco_brl * CASH_POR_REAL)))
 
     texto = (
         "💱 *Troca cash → TON*\n"
@@ -843,7 +757,7 @@ async def trocar_cash(msg: types.Message):
     ])
     await msg.answer(texto, parse_mode="Markdown", reply_markup=kb)
 
-@dp.callback_query(lambda c: c.data and c.data.startswith("swap:"))
+@dp.callback_query(F.data.startswith("swap:"))
 async def swap_cb(call: types.CallbackQuery):
     user_id = call.from_user.id
     row = cur.execute(
@@ -865,7 +779,7 @@ async def swap_cb(call: types.CallbackQuery):
         await call.answer("Saldo insuficiente.", show_alert=True)
         return
 
-    ton_out = amount / cash_por_ton  # quantidade de TON
+    ton_out = amount / cash_por_ton
     cur.execute(
         "UPDATE usuarios SET saldo_cash=saldo_cash-?, saldo_ton=saldo_ton+? WHERE telegram_id=?",
         (amount, ton_out, user_id)
@@ -879,11 +793,8 @@ async def swap_cb(call: types.CallbackQuery):
     )
     await call.answer()
 
-
-
 @dp.message(lambda m: m.text and m.text.lower().startswith("trocar "))
 async def trocar_texto(msg: types.Message):
-    # espera formato: "trocar 250"
     try:
         parts = msg.text.strip().split()
         amount = int(parts[1])
@@ -922,13 +833,12 @@ async def trocar_texto(msg: types.Message):
     )
 
 
-
+# ===== Saque =====
 @dp.message(F.text == "🏦 Sacar")
 async def sacar_menu(msg: types.Message):
     await msg.answer("Escolha uma opção de saque:", reply_markup=sacar_keyboard())
 
-
-@dp.message(Text("Wallet TON"))
+@dp.message(F.text == "Wallet TON")
 async def pedir_wallet(msg: types.Message, state: FSMContext):
     wal = get_wallet(msg.from_user.id)
     if wal:
@@ -950,8 +860,8 @@ async def alterar_wallet_cb(cb: types.CallbackQuery, state: FSMContext):
     await state.set_state(WalletStates.changing_wallet)
     await cb.answer()
 
-@dp.message(WalletStates.waiting_wallet)
-@dp.message(WalletStates.changing_wallet)
+@dp.message(StateFilter(WalletStates.waiting_wallet))
+@dp.message(StateFilter(WalletStates.changing_wallet))
 async def salvar_wallet(msg: types.Message, state: FSMContext):
     addr = msg.text.strip()
     if not is_valid_ton_wallet(addr):
@@ -960,7 +870,7 @@ async def salvar_wallet(msg: types.Message, state: FSMContext):
     await state.clear()
     await msg.answer(f"✅ Carteira salva:\n`{addr}`", parse_mode="Markdown", reply_markup=alterar_wallet_inline())
 
-@dp.message(Text("Pagamento"))
+@dp.message(F.text == "Pagamento")
 async def iniciar_pagamento(msg: types.Message, state: FSMContext):
     wal = get_wallet(msg.from_user.id)
     if not wal:
@@ -976,7 +886,7 @@ async def iniciar_pagamento(msg: types.Message, state: FSMContext):
     )
     await state.set_state(WithdrawStates.waiting_amount_ton)
 
-@dp.message_handler(state=WithdrawStates.waiting_amount_ton)
+@dp.message(StateFilter(WithdrawStates.waiting_amount_ton))
 async def processar_saque(msg: types.Message, state: FSMContext):
     try:
         amount_ton = float(msg.text.replace(",", "."))
@@ -990,11 +900,8 @@ async def processar_saque(msg: types.Message, state: FSMContext):
         await state.clear()
         return await msg.answer("Wallet não encontrada. Cadastre sua **Wallet TON** e tente novamente.")
 
-    # preço TON e parâmetro de conversão:
     ton_brl = get_ton_price_brl()
-    CASH_POR_REAL = int(os.getenv("CASH_POR_REAL", "100"))
 
-    # converte do cash_pagamentos -> ton (debitando cash_pagamentos)
     try:
         debit_cash_payments_and_credit_ton(
             user_id=msg.from_user.id,
@@ -1012,48 +919,37 @@ async def processar_saque(msg: types.Message, state: FSMContext):
     await msg.answer("⏳ Processando seu saque…")
 
     try:
-        # tente payout para ENDEREÇO (se seu app tiver)
         await cryptopay_transfer_ton_to_address(amount_ton, wallet, idemp)
         set_withdraw_status(wid, "done")
         await msg.answer(f"✅ Saque enviado!\nValor: {amount_ton:.6f} TON\nCarteira: `{wallet}`", parse_mode="Markdown")
 
-    except Exception as e:
-        # estorno da conversão (volta pro cash_pagamentos) para não prejudicar o usuário
+    except Exception:
         with db_conn() as c:
             c.execute(
                 "UPDATE usuarios SET saldo_cash_pagamentos = saldo_cash_pagamentos + (? * ? * ?), saldo_ton = saldo_ton - ? WHERE telegram_id=?",
-        (amount_ton, ton_brl, CASH_POR_REAL, amount_ton, msg.from_user.id)
-    )
+                (amount_ton, ton_brl, CASH_POR_REAL, amount_ton, msg.from_user.id)
+            )
         set_withdraw_status(wid, "failed")
         await msg.answer("❌ Não foi possível completar o saque agora (payout indisponível). O valor foi estornado para seu saldo de pagamentos. Tente novamente mais tarde.")
     finally:
         await state.clear()
 
 
-
-@dp.message(lambda msg: msg.text == "👫 Indique & Ganhe")
+@dp.message(F.text == "👫 Indique & Ganhe")
 async def indicacao(msg: types.Message):
     user_id = msg.from_user.id
-
-    # Conta quantas pessoas esse usuário indicou
     row = cur.execute("SELECT COUNT(*) FROM indicacoes WHERE por=?", (user_id,)).fetchone()
     total_refs = row[0] if row else 0
-
-    # Link de convite (deep link)
     link = f"https://t.me/{BOT_USERNAME}?start={user_id}"
-
     texto = (
         "🎁 <b>Indique & Ganhe</b>\n\n"
         f"Convide amigos e receba <b>{REF_PCT:.0f}%</b> de cada depósito que eles fizerem.\n\n"
         f"👥 <b>Indicações:</b> {total_refs}\n"
         f"🔗 <b>Seu link:</b> <code>{link}</code>"
     )
-
-    # Usa HTML para evitar problemas com underscores no link
     await msg.answer(texto, parse_mode="HTML")
 
-
-@dp.message(lambda msg: msg.text == "❓ Ajuda/Suporte")
+@dp.message(F.text == "❓ Ajuda/Suporte")
 async def ajuda(msg: types.Message):
     await msg.answer(
         "Dúvidas? Fale com o suporte: @seu_suporte\n\n"
@@ -1065,7 +961,6 @@ async def ajuda(msg: types.Message):
     )
 
 
-
 # ========= INICIAR BOT ==========
 def start_bot():
     asyncio.create_task(dp.start_polling(bot))
@@ -1074,11 +969,9 @@ def start_bot():
 async def on_startup():
     await bot.delete_webhook(drop_pending_updates=True)
     start_bot()
-    # inicia o pré-fetch do preço (não bloqueia o app)
     asyncio.create_task(_refresh_price_loop())
 
 
 # ========== FASTAPI MAIN ==========
 if __name__ == '__main__':
-    # Execução local (dev). No Render, use o Gunicorn no Start Command.
     uvicorn.run("fazenda_ton_bot.bot_main:app", host="0.0.0.0", port=8000, reload=True)
