@@ -303,20 +303,33 @@ def criar_invoice_cryptopay(user_id: int, valor_reais: float) -> str:
     inv = cryptopay_call("createInvoice", payload)
     return inv.get("bot_invoice_url") or inv.get("pay_url")
 
+def ensure_user(user_id: int):
+    with db_conn() as c:
+        c.execute(
+            "INSERT OR IGNORE INTO usuarios (telegram_id, criado_em) VALUES (?, ?)",
+            (user_id, datetime.now().isoformat())
+        )
+
+
 
 # === TECLADOS / BOTÕES ===
 def sacar_keyboard():
-    # v3: precisa passar `keyboard` no construtor
     return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="Wallet TON"), KeyboardButton(text="Pagamento")]],
+        keyboard=[
+            [KeyboardButton("Wallet TON"), KeyboardButton("Pagamento")],
+            [KeyboardButton("⬅️ Voltar")]
+        ],
         resize_keyboard=True
     )
 
+
 def alterar_wallet_inline():
-    # v3: precisa passar `inline_keyboard` no construtor
     return InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="Alterar Wallet", callback_data="alterar_wallet")]]
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Alterar Wallet", callback_data="alterar_wallet")]
+        ]
     )
+
 
 
 # === STATES (FSM) ===
@@ -344,6 +357,7 @@ def db_conn():
     return conn
 
 def set_wallet(user_id: int, wallet: str):
+    ensure_user(user_id)
     with db_conn() as c:
         c.execute("UPDATE usuarios SET carteira_ton=? WHERE telegram_id=?", (wallet, user_id))
 
@@ -852,10 +866,12 @@ async def pedir_wallet(msg: types.Message, state: FSMContext):
         await msg.answer("Para alterar sua carteira TON, toque no botão abaixo.", reply_markup=alterar_wallet_inline())
     else:
         await msg.answer(
-            "Envie agora **seu endereço de carteira TON** para receber os saques (ex.: começa com `UQ` ou `EQ`).",
-            parse_mode="Markdown"
-        )
-        await state.set_state(WalletStates.waiting_wallet)
+    "Envie agora **seu endereço de carteira TON** para receber os saques (ex.: começa com `UQ` ou `EQ`).",
+    parse_mode="Markdown",
+    reply_markup=kb_voltar()   # <= aqui
+)
+await state.set_state(WalletStates.waiting_wallet)
+
 
 @dp.callback_query(F.data == "alterar_wallet")
 async def alterar_wallet_cb(cb: types.CallbackQuery, state: FSMContext):
@@ -872,12 +888,34 @@ async def salvar_wallet(msg: types.Message, state: FSMContext):
     set_wallet(msg.from_user.id, addr)
     await state.clear()
     await msg.answer(f"✅ Carteira salva:\n`{addr}`", parse_mode="Markdown", reply_markup=alterar_wallet_inline())
+    await msg.answer("Pronto! Use o menu abaixo.", reply_markup=menu())
+
+# === atalhos quando o bot está esperando a carteira ===
+
+# 4.a) sair do fluxo de wallet e voltar ao menu
+@dp.message(StateFilter(WalletStates.waiting_wallet), F.text == "⬅️ Voltar")
+async def cancelar_wallet(msg: types.Message, state: FSMContext):
+    await state.clear()
+    await msg.answer("Voltei ao menu.", reply_markup=menu())
+
+# 4.b) ir para Pagamento mesmo estando no fluxo de wallet
+@dp.message(StateFilter(WalletStates.waiting_wallet), F.text == "Pagamento")
+async def atalho_pagamento(msg: types.Message, state: FSMContext):
+    await state.clear()
+    return await iniciar_pagamento(msg, state)
+
 
 @dp.message(F.text == "Pagamento")
 async def iniciar_pagamento(msg: types.Message, state: FSMContext):
+    # 7) garante que não estamos presos em nenhum estado anterior
+    await state.clear()
+
     wal = get_wallet(msg.from_user.id)
     if not wal:
-        return await msg.answer("Você ainda não definiu sua **Wallet TON**. Toque em *Wallet TON* e cadastre antes de sacar.", parse_mode="Markdown")
+        return await msg.answer(
+            "Você ainda não definiu sua **Wallet TON**. Toque em *Wallet TON* e cadastre antes de sacar.",
+            parse_mode="Markdown"
+        )
 
     _, saldo_pag, saldo_ton = get_balances(msg.from_user.id)
     await msg.answer(
