@@ -15,6 +15,9 @@ from aiogram.fsm.context import FSMContext
 from fastapi import FastAPI, Request
 import uvicorn
 
+from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter
+from aiohttp.client_exceptions import ClientOSError
+
 
 # ===== Preço do TON em BRL – robusto, com cache, retries e múltiplas fontes =====
 
@@ -348,6 +351,44 @@ def is_valid_ton_wallet(addr: str) -> bool:
 
 def normalize_wallet(addr: str) -> str:
     return re.sub(r'\s+', '', addr.strip())
+
+# === Envio de mensagens com retry ===
+async def safe_answer(msg: types.Message, *args, **kwargs):
+    """
+    Envia msg.answer(...) com 3 tentativas e pequenos atrasos
+    para aguentar quedas momentâneas do Telegram.
+    """
+    delays = [0.0, 0.6, 1.5]  # 3 tentativas
+    for i, d in enumerate(delays):
+        try:
+            return await msg.answer(*args, **kwargs)
+        except TelegramRetryAfter as e:
+            # quando o Telegram pede para esperar X segundos
+            await asyncio.sleep(float(getattr(e, "retry_after", 1)) + 0.3)
+        except (TelegramNetworkError, ClientOSError):
+            # desconexão momentânea: tenta de novo
+            if i == len(delays) - 1:
+                print("[safe_answer] network error após retries")
+                return None
+            await asyncio.sleep(d)
+
+async def safe_bot_send(chat_id: int, text: str, **kwargs):
+    """
+    Envia bot.send_message(...) com 3 tentativas.
+    Use quando NÃO tiver o objeto msg (ex.: notificações).
+    """
+    delays = [0.0, 0.6, 1.5]
+    for i, d in enumerate(delays):
+        try:
+            return await bot.send_message(chat_id, text, **kwargs)
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(float(getattr(e, "retry_after", 1)) + 0.3)
+        except (TelegramNetworkError, ClientOSError):
+            if i == len(delays) - 1:
+                print("[safe_bot_send] network error após retries")
+                return None
+            await asyncio.sleep(d)
+
 
 def new_idempotency_key(user_id: int) -> str:
     return f"wd-{user_id}-{int(time.time())}-{uuid.uuid4().hex[:8]}"
@@ -860,7 +901,8 @@ async def trocar_cash(msg: types.Message):
             types.InlineKeyboardButton(text="Tudo", callback_data="swap:all"),
         ]
     ])
-    await msg.answer(texto, parse_mode="Markdown", reply_markup=kb)
+    await safe_answer(msg, texto, parse_mode="Markdown", reply_markup=kb)
+
 
 @dp.callback_query(F.data.startswith("swap:"))
 async def swap_cb(call: types.CallbackQuery):
@@ -1095,7 +1137,9 @@ async def indicacao(msg: types.Message):
         f"👥 <b>Indicações:</b> {total_refs}\n"
         f"🔗 <b>Seu link:</b> <code>{link}</code>"
     )
-    await msg.answer(texto, parse_mode="HTML")
+    await safe_answer(msg, texto, parse_mode="HTML")
+
+
 
 @dp.message(F.text == "❓ Ajuda/Suporte")
 async def ajuda(msg: types.Message):
