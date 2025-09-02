@@ -927,7 +927,8 @@ async def admin_show_bal(msg: types.Message):
 
 # ===== Depósito via Crypto Pay (BRL) =====
 @dp.message(F.text == "➕ Depositar")
-async def depositar_menu(msg: types.Message):
+async def depositar_menu(msg: types.Message, state: FSMContext):  # ← add state
+    await state.clear()  # ← limpa qualquer fluxo ativo (saque, wallet etc.)
     kb = types.ReplyKeyboardMarkup(
         keyboard=[
             [types.KeyboardButton(text="R$ 10"), types.KeyboardButton(text="R$ 25")],
@@ -937,6 +938,7 @@ async def depositar_menu(msg: types.Message):
         resize_keyboard=True
     )
     await msg.answer("Escolha o valor do depósito em **reais**:", reply_markup=kb, parse_mode="Markdown")
+
 
 def _parse_reais(txt: str):
     t = txt.upper().replace("R$", "").strip().replace(",", ".")
@@ -1230,9 +1232,17 @@ async def processar_saque(msg: types.Message, state: FSMContext):
     await msg.answer("⏳ Processando seu saque…")
 
     try:
-        await cryptopay_transfer_ton_to_address(amount_ton, wallet, idemp)
-        set_withdraw_status(wid, "done")
-        await msg.answer(f"✅ Saque enviado!\nValor: {amount_ton:.6f} TON\nCarteira: `{wallet}`", parse_mode="Markdown")
+    await cryptopay_transfer_ton_to_address(amount_ton, wallet, idemp)
+
+    with db_conn() as c:
+        c.execute(
+            "UPDATE usuarios SET saldo_ton = saldo_ton - ? WHERE telegram_id=?",
+            (amount_ton, msg.from_user.id)
+        )
+
+    set_withdraw_status(wid, "done")
+    await msg.answer(f"✅ Saque enviado!\nValor: {amount_ton:.6f} TON\nCarteira: `{wallet}`", parse_mode="Markdown")
+
 
     except Exception:
         with db_conn() as c:
