@@ -13,6 +13,7 @@ from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 
 from fastapi import FastAPI, Request
+from fastapi.responses import FileResponse
 import uvicorn
 
 from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter
@@ -150,7 +151,12 @@ BOT_USERNAME = os.getenv("BOT_USERNAME", "SEU_BOT_USERNAME")
 
 # ========= DB ==========
 DB_PATH = os.getenv("DB_PATH", "/data/db.sqlite3")
+
+# >>> adiciona isto para garantir que a pasta do banco exista
+os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+
 print("DB_PATH em uso:", DB_PATH)
+
 
 def _column_exists(conn, table, column):
     cur = conn.execute(f"PRAGMA table_info({table})")
@@ -280,6 +286,30 @@ async def root():
 @app.get("/healthz")
 async def healthz():
     return {"ok": True}
+
+# ===== Admin helpers - checar/baixar o banco =====
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")  # defina no Render → Environment
+
+@app.get("/admin/db-info", include_in_schema=False)
+async def db_info(request: Request):
+    if not ADMIN_TOKEN or request.headers.get("X-Admin-Token") != ADMIN_TOKEN:
+        return {"ok": False, "error": "unauthorized"}
+    import pathlib, time
+    p = pathlib.Path(DB_PATH)
+    exists = p.exists()
+    return {
+        "ok": True,
+        "path": str(p),
+        "exists": exists,
+        "size_bytes": p.stat().st_size if exists else 0,
+        "modified": time.ctime(p.stat().st_mtime) if exists else None,
+    }
+
+@app.get("/admin/db-download", include_in_schema=False)
+async def db_download(request: Request):
+    if not ADMIN_TOKEN or request.headers.get("X-Admin-Token") != ADMIN_TOKEN:
+        return {"ok": False, "error": "unauthorized"}
+    return FileResponse(DB_PATH, filename="db.sqlite3")
 
 
 # ========= CRYPTO PAY HELPERS ==========
@@ -807,6 +837,91 @@ async def collect_now_cb(call: types.CallbackQuery):
     )
     await call.answer()
 
+# ========= ADMIN COMANDOS (somente OWNER_TELEGRAM_ID) =========
+
+@dp.message(Command("addpag"))
+async def admin_add_pag(msg: types.Message):
+    if not is_admin(msg.from_user.id):
+        return await msg.answer("Sem permissão.")
+    parts = (msg.text or "").split()
+    if len(parts) < 2:
+        return await msg.answer("Uso: /addpag <valor> [user_id]")
+    try:
+        amount = float(parts[1].replace(",", "."))
+    except:
+        return await msg.answer("Valor inválido.")
+    if amount <= 0:
+        return await msg.answer("Informe um valor positivo.")
+
+    target = msg.from_user.id
+    if len(parts) >= 3 and parts[2].isdigit():
+        target = int(parts[2])
+
+    ensure_user(target)
+    with db_conn() as c:
+        c.execute(
+            "UPDATE usuarios SET saldo_cash_pagamentos=COALESCE(saldo_cash_pagamentos,0)+? WHERE telegram_id=?",
+            (amount, target)
+        )
+    await msg.answer(f"✅ +{amount:.2f} cash (pagamentos) creditados para {target}.")
+
+
+@dp.message(Command("adddep"))
+async def admin_add_dep(msg: types.Message):
+    if not is_admin(msg.from_user.id):
+        return await msg.answer("Sem permissão.")
+    parts = (msg.text or "").split()
+    if len(parts) < 2:
+        return await msg.answer("Uso: /adddep <valor> [user_id]")
+    try:
+        amount = float(parts[1].replace(",", "."))
+    except:
+        return await msg.answer("Valor inválido.")
+    if amount <= 0:
+        return await msg.answer("Informe um valor positivo.")
+
+    target = msg.from_user.id
+    if len(parts) >= 3 and parts[2].isdigit():
+        target = int(parts[2])
+
+    ensure_user(target)
+    with db_conn() as c:
+        c.execute(
+            "UPDATE usuarios SET saldo_cash=COALESCE(saldo_cash,0)+? WHERE telegram_id=?",
+            (amount, target)
+        )
+    await msg.answer(f"✅ +{amount:.2f} cash (depósitos) creditados para {target}.")
+
+
+@dp.message(Command("showbal"))
+async def admin_show_bal(msg: types.Message):
+    if not is_admin(msg.from_user.id):
+        return await msg.answer("Sem permissão.")
+    parts = (msg.text or "").split()
+    target = msg.from_user.id
+    if len(parts) >= 2 and parts[1].isdigit():
+        target = int(parts[1])
+
+    with db_conn() as c:
+        r = c.execute(
+            "SELECT COALESCE(saldo_cash,0), COALESCE(saldo_cash_pagamentos,0), COALESCE(saldo_ton,0) "
+            "FROM usuarios WHERE telegram_id=?",
+            (target,)
+        ).fetchone()
+    if not r:
+        return await msg.answer(f"Usuário {target} não encontrado.")
+    saldo_cash, saldo_pag, saldo_ton = r
+    await msg.answer(
+        "📊 *Saldos*\n"
+        f"User: `{target}`\n"
+        f"• Cash (depósitos): `{saldo_cash:.2f}`\n"
+        f"• Cash (pagamentos): `{saldo_pag:.2f}`\n"
+        f"• TON: `{saldo_ton:.6f}`",
+        parse_mode="Markdown"
+    )
+
+
+
 
 # ===== Depósito via Crypto Pay (BRL) =====
 @dp.message(F.text == "➕ Depositar")
@@ -1166,4 +1281,4 @@ async def on_startup():
 
 # ========== FASTAPI MAIN ==========
 if __name__ == '__main__':
-    uvicorn.run("fazenda_ton_bot.bot_main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("fazenda_ton_bot.bot_main:app", host="0.0.0.0", port=8000, reload=False)
