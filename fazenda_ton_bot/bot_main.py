@@ -991,10 +991,11 @@ async def gerar_link_custom(msg: types.Message):
 async def trocar_cash(msg: types.Message):
     user_id = msg.from_user.id
     row = cur.execute(
-        "SELECT COALESCE(saldo_cash,0), COALESCE(saldo_ton,0) FROM usuarios WHERE telegram_id=?",
+        "SELECT COALESCE(saldo_cash_pagamentos,0), COALESCE(saldo_ton,0) FROM usuarios WHERE telegram_id=?",
         (user_id,)
     ).fetchone()
-    saldo_cash, saldo_ton = row if row else (0, 0)
+    saldo_pag, saldo_ton = row if row else (0, 0)
+
 
     preco_brl = get_ton_price_brl()
     cash_por_ton = max(1, int(round(preco_brl * CASH_POR_REAL)))
@@ -1025,27 +1026,29 @@ async def trocar_cash(msg: types.Message):
 async def swap_cb(call: types.CallbackQuery):
     user_id = call.from_user.id
     row = cur.execute(
-        "SELECT COALESCE(saldo_cash,0), COALESCE(saldo_ton,0) FROM usuarios WHERE telegram_id=?",
+        "SELECT COALESCE(saldo_cash_pagamentos,0), COALESCE(saldo_ton,0) FROM usuarios WHERE telegram_id=?",
         (user_id,)
     ).fetchone()
-    saldo_cash, saldo_ton = row if row else (0, 0)
+    saldo_pag, saldo_ton = row if row else (0, 0)
 
     preco_brl = get_ton_price_brl()
     cash_por_ton = max(1, int(round(preco_brl * CASH_POR_REAL)))
 
     _, amount_s = call.data.split(":", 1)
-    amount = saldo_cash if amount_s == "all" else int(amount_s)
+    amount = saldo_pag if amount_s == "all" else int(amount_s)
 
     if amount < 20:
         await call.answer("Mínimo 20 cash.", show_alert=True)
         return
-    if amount > saldo_cash:
+    # >>> AQUI troca para saldo_pag (antes estava saldo_cash)
+    if amount > saldo_pag:
         await call.answer("Saldo insuficiente.", show_alert=True)
         return
 
     ton_out = amount / cash_por_ton
+    # >>> AQUI debita de saldo_cash_pagamentos (antes debitava de saldo_cash)
     cur.execute(
-        "UPDATE usuarios SET saldo_cash=saldo_cash-?, saldo_ton=saldo_ton+? WHERE telegram_id=?",
+        "UPDATE usuarios SET saldo_cash_pagamentos=saldo_cash_pagamentos-?, saldo_ton=saldo_ton+? WHERE telegram_id=?",
         (amount, ton_out, user_id)
     )
     con.commit()
@@ -1056,6 +1059,7 @@ async def swap_cb(call: types.CallbackQuery):
         parse_mode="Markdown"
     )
     await call.answer()
+
 
 @dp.message(lambda m: m.text and m.text.lower().startswith("trocar "))
 async def trocar_texto(msg: types.Message):
@@ -1068,15 +1072,15 @@ async def trocar_texto(msg: types.Message):
 
     user_id = msg.from_user.id
     row = cur.execute(
-        "SELECT COALESCE(saldo_cash,0), COALESCE(saldo_ton,0) FROM usuarios WHERE telegram_id=?",
+        "SELECT COALESCE(saldo_cash_pagamentos,0), COALESCE(saldo_ton,0) FROM usuarios WHERE telegram_id=?",
         (user_id,)
     ).fetchone()
-    saldo_cash, saldo_ton = row if row else (0, 0)
+    saldo_pag, saldo_ton = row if row else (0, 0)
 
     if amount < 20:
         await msg.answer("Mínimo 20 cash.")
         return
-    if amount > saldo_cash:
+    if amount > saldo_pag:
         await msg.answer("Saldo insuficiente.")
         return
 
@@ -1085,7 +1089,7 @@ async def trocar_texto(msg: types.Message):
     ton_out = amount / cash_por_ton
 
     cur.execute(
-        "UPDATE usuarios SET saldo_cash=saldo_cash-?, saldo_ton=saldo_ton+? WHERE telegram_id=?",
+        "UPDATE usuarios SET saldo_cash_pagamentos=saldo_cash_pagamentos-?, saldo_ton=saldo_ton+? WHERE telegram_id=?",
         (amount, ton_out, user_id)
     )
     con.commit()
