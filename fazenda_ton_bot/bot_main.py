@@ -332,7 +332,7 @@ def criar_invoice_cryptopay(user_id: int, valor_reais: float) -> str:
         "currency_type": "fiat",
         "fiat": "BRL",
         "amount": f"{valor_reais:.2f}",
-        "accepted_assets": "USDT,TON",
+        "accepted_assets": "TON",          # ✅ só aceita TON
         "payload": str(user_id),
         "description": "Depósito Fazendinha"
     }
