@@ -151,11 +151,13 @@ BOT_USERNAME = os.getenv("BOT_USERNAME", "SEU_BOT_USERNAME")
 
 # ========= DB ==========
 DB_PATH = os.getenv("DB_PATH", "/data/db.sqlite3")
-
-# >>> adiciona isto para garantir que a pasta do banco exista
-os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-
 print("DB_PATH em uso:", DB_PATH)
+
+# garante que a pasta do banco exista (só cria se houver diretório no path)
+db_dir = os.path.dirname(DB_PATH)
+if db_dir:
+    os.makedirs(db_dir, exist_ok=True)
+
 
 
 def _column_exists(conn, table, column):
