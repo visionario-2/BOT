@@ -946,7 +946,7 @@ def _parse_reais(txt: str):
     except:
         return None
 
-@dp.message(F.text.in_(["R$ 10","R$ 25","R$ 50","R$ 100"]))
+@dp.message(StateFilter(None), F.text.in_(["R$ 10","R$ 25","R$ 50","R$ 100"]))
 async def gerar_link_padrao(msg: types.Message):
     if not CRYPTOPAY_TOKEN:
         await msg.answer("Configuração de pagamento ausente. Avise o suporte.")
@@ -962,11 +962,11 @@ async def gerar_link_padrao(msg: types.Message):
         "Assim que o pagamento for confirmado, eu credito seus cash. ⏳"
     )
 
-@dp.message(F.text == "Outro valor (R$)")
+@dp.message(StateFilter(None), F.text == "Outro valor (R$)")
 async def outro_valor(msg: types.Message):
     await msg.answer("Envie o valor desejado em reais. Ex.: 37,90")
 
-@dp.message(lambda m: _parse_reais(m.text) is not None and "R$" not in m.text and "TON" not in m.text)
+@dp.message(StateFilter(None), lambda m: _parse_reais(m.text) is not None and "R$" not in m.text and "TON" not in m.text)
 async def gerar_link_custom(msg: types.Message):
     if not CRYPTOPAY_TOKEN:
         await msg.answer("Configuração de pagamento ausente. Avise o suporte.")
