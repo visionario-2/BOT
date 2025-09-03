@@ -585,9 +585,15 @@ async def start(msg: types.Message):
         )
         con.commit()
 
-    cur.execute("SELECT saldo_cash, saldo_ton FROM usuarios WHERE telegram_id=?", (user_id,))
-    row = cur.fetchone()
-    saldo_cash, saldo_ton = row if row else (0, 0)
+    cur.execute("""
+    SELECT 
+        COALESCE(saldo_cash,0),
+        COALESCE(saldo_cash_pagamentos,0),
+        COALESCE(saldo_ton,0)
+    FROM usuarios WHERE telegram_id=?
+""", (user_id,))
+row = cur.fetchone() or (0,0,0)
+saldo_cash, saldo_pag, saldo_ton = row
 
     cur.execute("SELECT SUM(quantidade) FROM inventario WHERE telegram_id=?", (user_id,))
     total_animais = cur.fetchone()[0] or 0
@@ -601,8 +607,9 @@ async def start(msg: types.Message):
 
     texto = (
         "🌾 *Bem-vindo à Fazenda TON!*\n\n"
-        f"💸 Cash: `{saldo_cash:.0f}`\n"
-        f"💎 TON: `{saldo_ton:.4f}`\n"
+        f"• 💸 Cash (depósitos): `{saldo_cash:.0f}`\n"
+        f"• 🧾 Cash pagamentos: `{saldo_pag:.0f}`\n"
+        f"• 💎 TON: `{saldo_ton:.4f}`\n"
         f"🐾 Animais: `{total_animais}`\n"
         f"📈 Rendimento/dia: `{rendimento_dia:.2f}` cash\n\n"
         "Escolha uma opção:"
@@ -783,7 +790,7 @@ async def trocar_cash(msg: types.Message):
     cash_por_ton = max(1, int(round(preco_brl * CASH_POR_REAL)))
 
     texto = (
-        "💱 *Troca cash pagamentos → TON*\n""
+        "💱 *Troca cash pagamentos → TON*\n"
         f"Preço atual (CoinGecko): `1 TON ≈ R$ {preco_brl:.2f}`\n"
         f"Equivalência: `1 TON ≈ {cash_por_ton} cash`\n\n"
         f"Seu cash pagamentos disponível: `{saldo_pag:.0f}`\n\n"
@@ -879,13 +886,6 @@ async def trocar_texto(msg: types.Message):
         parse_mode="Markdown"
     )
 
-    con.commit()
-
-    await msg.answer(
-        f"✅ Convertidos `{amount}` cash → `{ton_out:.5f}` TON\n"
-        f"`1 TON = {cash_por_ton} cash` (≈ R$ {preco_brl:.2f}).",
-        parse_mode="Markdown"
-    )
 
 
 # ===== Saque =====
@@ -1058,98 +1058,48 @@ async def ajuda(msg: types.Message):
         "Qualquer dúvida, fale conosco!"
     )
 
-    # ===== Admin commands =====
-def _target_user_id(msg: types.Message, parts: list) -> int:
-    # prioridade: reply > argumento [user_id] > próprio
-    if msg.reply_to_message:
-        return msg.reply_to_message.from_user.id
-    if len(parts) >= 3 and str(parts[2]).isdigit():
-        return int(parts[2])
-    if len(parts) >= 2 and str(parts[1]).isdigit():
-        return int(parts[1])
-    return msg.from_user.id
-
-def _only_admin(msg: types.Message) -> bool:
-    return is_admin(msg.from_user.id)
-
-@dp.message(Command("saldo"))
-async def cmd_saldo(msg: types.Message):
-    if not _only_admin(msg):
+# ===== COMANDOS DE ADMIN =====
+@dp.message(Command("addcash"))
+async def add_cash(msg: types.Message):
+    if not is_admin(msg.from_user.id):
         return
-    parts = (msg.text or "").split()
-    uid = _target_user_id(msg, parts)
-    r = cur.execute("""
-        SELECT COALESCE(saldo_cash,0), COALESCE(saldo_cash_pagamentos,0), COALESCE(saldo_ton,0)
-        FROM usuarios WHERE telegram_id=?
-    """, (uid,)).fetchone()
-    if not r:
-        await msg.answer(f"Usuário {uid} não encontrado.")
-        return
-    cash_dep, cash_pag, ton = r
-    await msg.answer(
-        f"UID `{uid}`\n"
-        f"• cash depósitos: `{cash_dep:.0f}`\n"
-        f"• cash pagamentos: `{cash_pag:.0f}`\n"
-        f"• TON: `{ton:.6f}`",
-        parse_mode="Markdown"
-    )
+    try:
+        _, uid, valor = msg.text.split()
+        uid = int(uid)
+        valor = int(valor)
+    except:
+        return await msg.answer("Uso: /addcash <user_id> <valor>")
+    cur.execute("UPDATE usuarios SET saldo_cash=COALESCE(saldo_cash,0)+? WHERE telegram_id=?", (valor, uid))
+    con.commit()
+    await msg.answer(f"✅ Adicionado {valor} cash ao usuário {uid}")
 
 @dp.message(Command("addpag"))
-async def cmd_addpag(msg: types.Message):
-    if not _only_admin(msg):
-        return
-    parts = (msg.text or "").split()
-    if len(parts) < 2:
-        await msg.answer("Uso: /addpag <valor> [user_id] (ou responda a uma mensagem do usuário)")
+async def add_pag(msg: types.Message):
+    if not is_admin(msg.from_user.id):
         return
     try:
-        val = float(parts[1])
+        _, uid, valor = msg.text.split()
+        uid = int(uid)
+        valor = int(valor)
     except:
-        await msg.answer("Valor inválido.")
-        return
-    uid = _target_user_id(msg, parts)
-    cur.execute("INSERT OR IGNORE INTO usuarios(telegram_id,criado_em) VALUES(?,?)", (uid, datetime.now().isoformat()))
-    cur.execute("UPDATE usuarios SET saldo_cash_pagamentos=COALESCE(saldo_cash_pagamentos,0)+? WHERE telegram_id=?", (val, uid))
+        return await msg.answer("Uso: /addpag <user_id> <valor>")
+    cur.execute("UPDATE usuarios SET saldo_cash_pagamentos=COALESCE(saldo_cash_pagamentos,0)+? WHERE telegram_id=?", (valor, uid))
     con.commit()
-    await msg.answer(f"OK: +{val} ao *cash pagamentos* de `{uid}`.", parse_mode="Markdown")
-
-@dp.message(Command("adddep"))
-async def cmd_adddep(msg: types.Message):
-    if not _only_admin(msg):
-        return
-    parts = (msg.text or "").split()
-    if len(parts) < 2:
-        await msg.answer("Uso: /adddep <valor> [user_id]")
-        return
-    try:
-        val = float(parts[1])
-    except:
-        await msg.answer("Valor inválido.")
-        return
-    uid = _target_user_id(msg, parts)
-    cur.execute("INSERT OR IGNORE INTO usuarios(telegram_id,criado_em) VALUES(?,?)", (uid, datetime.now().isoformat()))
-    cur.execute("UPDATE usuarios SET saldo_cash=COALESCE(saldo_cash,0)+? WHERE telegram_id=?", (val, uid))
-    con.commit()
-    await msg.answer(f"OK: +{val} ao *cash depósitos* de `{uid}`.", parse_mode="Markdown")
+    await msg.answer(f"✅ Adicionado {valor} cash_pagamentos ao usuário {uid}")
 
 @dp.message(Command("addton"))
-async def cmd_addton(msg: types.Message):
-    if not _only_admin(msg):
-        return
-    parts = (msg.text or "").split()
-    if len(parts) < 2:
-        await msg.answer("Uso: /addton <valor> [user_id]")
+async def add_ton(msg: types.Message):
+    if not is_admin(msg.from_user.id):
         return
     try:
-        val = float(parts[1])
+        _, uid, valor = msg.text.split()
+        uid = int(uid)
+        valor = float(valor)
     except:
-        await msg.answer("Valor inválido.")
-        return
-    uid = _target_user_id(msg, parts)
-    cur.execute("INSERT OR IGNORE INTO usuarios(telegram_id,criado_em) VALUES(?,?)", (uid, datetime.now().isoformat()))
-    cur.execute("UPDATE usuarios SET saldo_ton=COALESCE(saldo_ton,0)+? WHERE telegram_id=?", (val, uid))
+        return await msg.answer("Uso: /addton <user_id> <valor>")
+    cur.execute("UPDATE usuarios SET saldo_ton=COALESCE(saldo_ton,0)+? WHERE telegram_id=?", (valor, uid))
     con.commit()
-    await msg.answer(f"OK: +{val} TON para `{uid}`.", parse_mode="Markdown")
+    await msg.answer(f"✅ Adicionado {valor} TON ao usuário {uid}")
 
 
 # ========= INICIAR BOT =========
