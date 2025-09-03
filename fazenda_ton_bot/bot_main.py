@@ -274,8 +274,9 @@ REF_PCT = float(os.getenv("REF_PCT", "4"))
 
 # ========= BOT / APP ==========
 from aiogram.client.session.aiohttp import AiohttpSession
+from aiohttp import ClientTimeout  # <-- adicione esta importação
 
-_session = AiohttpSession(timeout=10)
+_session = AiohttpSession(timeout=ClientTimeout(total=10))
 bot = Bot(token=TOKEN, session=_session)
 
 dp = Dispatcher()
@@ -571,7 +572,8 @@ async def start(msg: types.Message):
     user_id = msg.from_user.id
     cur.execute(
         "INSERT OR IGNORE INTO usuarios (telegram_id, criado_em) VALUES (?, ?)",
-        (user_id, datetime.now().isoformat()))
+        (user_id, datetime.now().isoformat())
+    )
     con.commit()
 
     parts = (msg.text or "").split()
@@ -585,16 +587,11 @@ async def start(msg: types.Message):
         )
         con.commit()
 
-    cur.execute("""
-    SELECT 
-        COALESCE(saldo_cash,0),
-        COALESCE(saldo_cash_pagamentos,0),
-        COALESCE(saldo_ton,0)
-    FROM usuarios WHERE telegram_id=?
-""", (user_id,))
-row = cur.fetchone() or (0,0,0)
-saldo_cash, saldo_pag, saldo_ton = row
+    cur.execute("SELECT saldo_cash, saldo_ton FROM usuarios WHERE telegram_id=?", (user_id,))
+    row = cur.fetchone()
+    saldo_cash, saldo_ton = row if row else (0, 0)
 
+    # 🔧 estas duas linhas precisam estar alinhadas com as de cima (sem indent extra)
     cur.execute("SELECT SUM(quantidade) FROM inventario WHERE telegram_id=?", (user_id,))
     total_animais = cur.fetchone()[0] or 0
 
@@ -607,14 +604,14 @@ saldo_cash, saldo_pag, saldo_ton = row
 
     texto = (
         "🌾 *Bem-vindo à Fazenda TON!*\n\n"
-        f"• 💸 Cash (depósitos): `{saldo_cash:.0f}`\n"
-        f"• 🧾 Cash pagamentos: `{saldo_pag:.0f}`\n"
-        f"• 💎 TON: `{saldo_ton:.4f}`\n"
+        f"💸 Cash: `{saldo_cash:.0f}`\n"
+        f"💎 TON: `{saldo_ton:.4f}`\n"
         f"🐾 Animais: `{total_animais}`\n"
         f"📈 Rendimento/dia: `{rendimento_dia:.2f}` cash\n\n"
         "Escolha uma opção:"
     )
     await msg.answer(texto, reply_markup=menu(), parse_mode="Markdown")
+
 
 
 @dp.message(F.text == "💰 Meu Saldo")
