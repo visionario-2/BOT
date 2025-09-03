@@ -276,7 +276,7 @@ REF_PCT = float(os.getenv("REF_PCT", "4"))
 
 
 # ========= BOT / APP ==========
-bot = Bot(token=TOKEN)
+bot = Bot(token=TOKEN, request_timeout=20)
 dp = Dispatcher()
 
 app = FastAPI()
@@ -475,7 +475,8 @@ class CryptoPayError(Exception):
 
 async def cryptopay_transfer_ton_to_address(amount_ton: float, ton_address: str, idempotency_key: str):
     """
-    Payout on-chain (APP -> endereço TON). Para idempotência, o Crypto Pay usa spend_id no payload.
+    Payout on-chain (APP -> endereço TON).
+    A idempotência do Crypto Pay é via spend_id no *payload*.
     """
     if amount_ton <= 0:
         raise CryptoPayError("Valor inválido.")
@@ -488,24 +489,22 @@ async def cryptopay_transfer_ton_to_address(amount_ton: float, ton_address: str,
         "asset": "TON",
         "amount": str(amount_ton),
         "address": ton_address,
-        # 👇 idempotência correta para createPayout
-        "spend_id": idempotency_key,
+        "spend_id": idempotency_key,   # << chave única da operação
     }
 
     async with httpx.AsyncClient(timeout=30) as cli:
         r = await cli.post("https://pay.crypt.bot/api/createPayout", headers=headers, json=payload)
-        # logging leve para você depurar no servidor
         try:
             data = r.json()
         except Exception:
             data = {"ok": False, "description": r.text}
 
         if r.status_code != 200 or not data.get("ok"):
-            # deixe o usuário com msg genérica; logue o motivo aqui
-            print("[createPayout] fail:", data)
+            print("[createPayout] fail:", data)   # log p/ você
             raise CryptoPayError("createPayout falhou")
 
         return data["result"]
+
 
 
 def verify_cryptopay_signature(body_bytes: bytes, signature_hex: str, token: str) -> bool:
@@ -518,8 +517,7 @@ def verify_cryptopay_signature(body_bytes: bytes, signature_hex: str, token: str
 
 async def cryptopay_get_app_ton_balance() -> float:
     """
-    Retorna o saldo TON disponível no *APP* (Dentate Owl App),
-    igual ao que você vê no botão 'My Apps' do @CryptoBot.
+    Saldo TON disponível no APP (o que aparece em My Apps -> Dentate Owl).
     """
     headers = {
         "Crypto-Pay-API-Token": CRYPTOPAY_TOKEN,
@@ -532,7 +530,6 @@ async def cryptopay_get_app_ton_balance() -> float:
         if not data.get("ok"):
             raise CryptoPayError(f"getBalance falhou: {data}")
         items = data["result"] or []
-        # procura TON na lista
         for it in items:
             code = (it.get("currency_code") or it.get("asset") or it.get("code") or "").upper()
             if code == "TON":
@@ -542,6 +539,7 @@ async def cryptopay_get_app_ton_balance() -> float:
                 except Exception:
                     return 0.0
         return 0.0
+
 
 
 # ========= RENDIMENTO / COLETA MANUAL =========
@@ -1269,12 +1267,7 @@ async def processar_saque(msg: types.Message, state: FSMContext):
     if amount_ton > app_ton + 1e-9:
         await state.clear()
         return await msg.answer(
-            "❌ Saldo insuficiente no APP (Crypto Pay) para realizar o payout agora.\n"
-            f"Disponível no APP: `{app_ton:.6f}` TON\n"
-            f"Solicitado: `{amount_ton:.6f}` TON\n\n"
-            "Tente um valor menor ou aguarde o administrador abastecer o App.",
-            parse_mode="Markdown"
-        )
+            "Não foi possível concluir esta solicitação agora. Tente novamente mais tarde.")
 
     # 5) cria registro e tenta pagar
     idemp = new_idempotency_key(msg.from_user.id)
@@ -1351,9 +1344,22 @@ def start_bot():
 
 @app.on_event("startup")
 async def on_startup():
-    await bot.delete_webhook(drop_pending_updates=True)
+    try:
+        # às vezes o Telegram demora a responder; não derrube o app por isso
+        await bot.delete_webhook(drop_pending_updates=True)
+    except Exception as e:
+        print("[startup] delete_webhook falhou (ignorando):", repr(e))
+
     start_bot()
     asyncio.create_task(_refresh_price_loop())
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    try:
+        await bot.session.close()
+    except Exception:
+        pass
+
 
 
 # ========== FASTAPI MAIN ==========
