@@ -474,29 +474,37 @@ class CryptoPayError(Exception):
     pass
 
 async def cryptopay_transfer_ton_to_address(amount_ton: float, ton_address: str, idempotency_key: str):
+    """
+    Payout on-chain (APP -> endereço TON). Para idempotência, o Crypto Pay usa spend_id no payload.
+    """
+    if amount_ton <= 0:
+        raise CryptoPayError("Valor inválido.")
+
     headers = {
         "Crypto-Pay-API-Token": CRYPTOPAY_TOKEN,
-        "Idempotency-Key": idempotency_key
+        "Accept": "application/json",
     }
-    payload = {"asset": "TON", "amount": str(amount_ton), "address": ton_address}
+    payload = {
+        "asset": "TON",
+        "amount": str(amount_ton),
+        "address": ton_address,
+        # 👇 idempotência correta para createPayout
+        "spend_id": idempotency_key,
+    }
+
     async with httpx.AsyncClient(timeout=30) as cli:
         r = await cli.post("https://pay.crypt.bot/api/createPayout", headers=headers, json=payload)
-        data = r.json() if r.headers.get("content-type","").startswith("application/json") else {"ok": False, "description": r.text}
-        if r.status_code != 200 or not data.get("ok"):
-            raise CryptoPayError(f"createPayout falhou: {data}")
-        return data["result"]
+        # logging leve para você depurar no servidor
+        try:
+            data = r.json()
+        except Exception:
+            data = {"ok": False, "description": r.text}
 
-async def cryptopay_transfer_ton_to_user(amount_ton: float, crypto_user_id: int, idempotency_key: str):
-    headers = {
-        "Crypto-Pay-API-Token": CRYPTOPAY_TOKEN,
-        "Idempotency-Key": idempotency_key
-    }
-    payload = {"asset": "TON", "amount": str(amount_ton), "user_id": crypto_user_id}
-    async with httpx.AsyncClient(timeout=30) as cli:
-        r = await cli.post("https://pay.crypt.bot/api/transfer", headers=headers, json=payload)
-        data = r.json() if r.headers.get("content-type","").startswith("application/json") else {"ok": False, "description": r.text}
         if r.status_code != 200 or not data.get("ok"):
-            raise CryptoPayError(f"transfer falhou: {data}")
+            # deixe o usuário com msg genérica; logue o motivo aqui
+            print("[createPayout] fail:", data)
+            raise CryptoPayError("createPayout falhou")
+
         return data["result"]
 
 
