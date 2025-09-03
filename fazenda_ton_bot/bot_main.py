@@ -969,63 +969,70 @@ async def iniciar_pagamento(msg: types.Message, state: FSMContext):
             reply_markup=sacar_keyboard()
         )
 
-    _, saldo_pag, saldo_ton = get_balances(msg.from_user.id)
+    # Mostra apenas o saldo TON
+    _, _, saldo_ton = get_balances(msg.from_user.id)
     await msg.answer(
         "Quanto você deseja sacar **em TON**?\n\n"
-        f"• Saldo de pagamentos (cash dos animais): {saldo_pag:.2f} cash\n"
-        f"• Saldo TON: {saldo_ton:.6f} TON\n\n"
-        "Obs.: só é permitido sacar o valor **gerado pelos animais**. No saque, converteremos do *cash de pagamentos* para TON.",
+        f"• Saldo TON disponível: {saldo_ton:.6f} TON\n\n"
+        "Digite apenas o número (ex.: `0.2`).",
         parse_mode="Markdown"
     )
     await state.set_state(WithdrawStates.waiting_amount_ton)
 
+
 @dp.message(StateFilter(WithdrawStates.waiting_amount_ton))
 async def processar_saque(msg: types.Message, state: FSMContext):
+    # validar número
     try:
-        amount_ton = float(msg.text.replace(",", "."))
+        amount_ton = float((msg.text or "").replace(",", "."))
         if amount_ton <= 0:
             return await msg.answer("Valor inválido. Envie um número maior que zero.")
     except:
         return await msg.answer("Não entendi. Envie apenas o **número** (ex.: 1.25).")
 
-    wallet = get_wallet(msg.from_user.id)
+    user_id = msg.from_user.id
+    wallet = get_wallet(user_id)
     if not wallet:
         await state.clear()
         return await msg.answer("Wallet não encontrada. Cadastre sua **Wallet TON** e tente novamente.")
 
-    ton_brl = get_ton_price_brl()
+    # Checar e reservar saldo TON (não mexe em 'cash pagamentos')
+    with db_conn() as c:
+        row = c.execute("SELECT saldo_ton FROM usuarios WHERE telegram_id=?", (user_id,)).fetchone()
+        saldo_ton = row["saldo_ton"] if row else 0.0
+        if saldo_ton + 1e-9 < amount_ton:
+            await state.clear()
+            return await msg.answer(
+                f"Saldo TON insuficiente para sacar {amount_ton:.6f} TON. "
+                f"Seu saldo é {saldo_ton:.6f} TON."
+            )
+        # reserva (debita) o TON antes de enviar o payout
+        c.execute("UPDATE usuarios SET saldo_ton = saldo_ton - ? WHERE telegram_id=?", (amount_ton, user_id))
 
-    try:
-        debit_cash_payments_and_credit_ton(
-            user_id=msg.from_user.id,
-            amount_ton=amount_ton,
-            ton_brl_price=ton_brl,
-            cash_por_real=CASH_POR_REAL
-        )
-    except Exception as e:
-        await state.clear()
-        return await msg.answer(f"Saldo insuficiente nos **pagamentos** para converter {amount_ton:.6f} TON. ({e})")
-
-    idemp = new_idempotency_key(msg.from_user.id)
-    wid = create_withdraw(msg.from_user.id, requested_ton=amount_ton, wallet=wallet, idemp=idemp)
+    idemp = new_idempotency_key(user_id)
+    wid = create_withdraw(user_id, requested_ton=amount_ton, wallet=wallet, idemp=idemp)
     set_withdraw_status(wid, "processing")
     await msg.answer("⏳ Processando seu saque…")
 
     try:
         await cryptopay_transfer_ton_to_address(amount_ton, wallet, idemp)
         set_withdraw_status(wid, "done")
-        await msg.answer(f"✅ Saque enviado!\nValor: {amount_ton:.6f} TON\nCarteira: `{wallet}`", parse_mode="Markdown")
-
+        await msg.answer(
+            f"✅ Saque enviado!\nValor: {amount_ton:.6f} TON\nCarteira: `{wallet}`",
+            parse_mode="Markdown"
+        )
     except Exception:
+        # rollback do TON em caso de falha no payout
         with db_conn() as c:
-            c.execute(
-                "UPDATE usuarios SET saldo_cash_pagamentos = saldo_cash_pagamentos + (? * ? * ?), saldo_ton = saldo_ton - ? WHERE telegram_id=?",
-                (amount_ton, ton_brl, CASH_POR_REAL, amount_ton, msg.from_user.id)
-            )
+            c.execute("UPDATE usuarios SET saldo_ton = saldo_ton + ? WHERE telegram_id=?", (amount_ton, user_id))
         set_withdraw_status(wid, "failed")
-        await msg.answer("❌ Não foi possível completar o saque agora (payout indisponível). O valor foi estornado para seu saldo de pagamentos. Tente novamente mais tarde.")
+        await msg.answer(
+            "❌ Não foi possível completar o saque agora (payout indisponível). "
+            "O valor foi estornado para seu saldo TON. Tente novamente mais tarde."
+        )
     finally:
         await state.clear()
+
 
 
 @dp.message(F.text == "👫 Indique & Ganhe")
