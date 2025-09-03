@@ -19,6 +19,10 @@ import uvicorn
 from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter
 from aiohttp.client_exceptions import ClientOSError
 
+# 👉 NEW: sessão com timeout para o Bot (evita crash no startup)
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiohttp import ClientTimeout
+
 
 # ===== Preço do TON em BRL – robusto, com cache, retries e múltiplas fontes =====
 
@@ -153,18 +157,14 @@ BOT_USERNAME = os.getenv("BOT_USERNAME", "SEU_BOT_USERNAME")
 DB_PATH = os.getenv("DB_PATH", "/data/db.sqlite3")
 print("DB_PATH em uso:", DB_PATH)
 
-# garante que a pasta do banco exista (só cria se houver diretório no path)
 db_dir = os.path.dirname(DB_PATH)
 if db_dir:
     os.makedirs(db_dir, exist_ok=True)
-
-
 
 def _column_exists(conn, table, column):
     cur = conn.execute(f"PRAGMA table_info({table})")
     return any(r[1] == column for r in cur.fetchall())
 
-# conexão global usada por partes do código
 con = sqlite3.connect(DB_PATH, check_same_thread=False)
 cur = con.cursor()
 
@@ -261,7 +261,6 @@ def ensure_schema():
     finally:
         conn.close()
 
-# cria tudo primeiro, depois prossegue
 init_db()
 cadastrar_animais()
 ensure_schema()
@@ -276,7 +275,9 @@ REF_PCT = float(os.getenv("REF_PCT", "4"))
 
 
 # ========= BOT / APP ==========
-bot = Bot(token=TOKEN, request_timeout=20)
+# 👉 NEW: cria sessão com timeout e passa para o Bot (em vez de request_timeout no __init__)
+_session = AiohttpSession(timeout=ClientTimeout(total=20))
+bot = Bot(token=TOKEN, session=_session)
 dp = Dispatcher()
 
 app = FastAPI()
@@ -290,7 +291,7 @@ async def healthz():
     return {"ok": True}
 
 # ===== Admin helpers - checar/baixar o banco =====
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")  # defina no Render → Environment
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
 
 @app.get("/admin/db-info", include_in_schema=False)
 async def db_info(request: Request):
@@ -332,7 +333,7 @@ def criar_invoice_cryptopay(user_id: int, valor_reais: float) -> str:
         "currency_type": "fiat",
         "fiat": "BRL",
         "amount": f"{valor_reais:.2f}",
-        "accepted_assets": "TON",          # ✅ só aceita TON
+        "accepted_assets": "TON",
         "payload": str(user_id),
         "description": "Depósito Fazendinha"
     }
@@ -386,29 +387,19 @@ def normalize_wallet(addr: str) -> str:
 
 # === Envio de mensagens com retry ===
 async def safe_answer(msg: types.Message, *args, **kwargs):
-    """
-    Envia msg.answer(...) com 3 tentativas e pequenos atrasos
-    para aguentar quedas momentâneas do Telegram.
-    """
-    delays = [0.0, 0.6, 1.5]  # 3 tentativas
+    delays = [0.0, 0.6, 1.5]
     for i, d in enumerate(delays):
         try:
             return await msg.answer(*args, **kwargs)
         except TelegramRetryAfter as e:
-            # quando o Telegram pede para esperar X segundos
             await asyncio.sleep(float(getattr(e, "retry_after", 1)) + 0.3)
         except (TelegramNetworkError, ClientOSError):
-            # desconexão momentânea: tenta de novo
             if i == len(delays) - 1:
                 print("[safe_answer] network error após retries")
                 return None
             await asyncio.sleep(d)
 
 async def safe_bot_send(chat_id: int, text: str, **kwargs):
-    """
-    Envia bot.send_message(...) com 3 tentativas.
-    Use quando NÃO tiver o objeto msg (ex.: notificações).
-    """
     delays = [0.0, 0.6, 1.5]
     for i, d in enumerate(delays):
         try:
@@ -506,7 +497,6 @@ async def cryptopay_transfer_ton_to_address(amount_ton: float, ton_address: str,
         return data["result"]
 
 
-
 def verify_cryptopay_signature(body_bytes: bytes, signature_hex: str, token: str) -> bool:
     try:
         secret = hashlib.sha256(token.encode()).digest()
@@ -541,7 +531,6 @@ async def cryptopay_get_app_ton_balance() -> float:
         return 0.0
 
 
-
 # ========= RENDIMENTO / COLETA MANUAL =========
 DAY_SECS = 86400.0
 
@@ -556,7 +545,6 @@ def _rows_animais_user(user_id: int):
         ).fetchall()
 
 def compute_pending_cash(user_id: int) -> float:
-    """Quanto o usuário tem acumulado (não coletado) em cash."""
     rows = _rows_animais_user(user_id)
     now_ts = time.time()
     total = 0.0
@@ -573,7 +561,6 @@ def compute_pending_cash(user_id: int) -> float:
     return round(total, 2)
 
 def collect_pending_cash(user_id: int) -> float:
-    """Credita o acumulado no saldo de pagamentos e atualiza ultima_coleta para agora."""
     amount = compute_pending_cash(user_id)
     if amount <= 0:
         return 0.0
@@ -719,7 +706,6 @@ async def start(msg: types.Message):
         )
         con.commit()
 
-    # saldos
     cur.execute(
         "SELECT COALESCE(saldo_cash,0), COALESCE(saldo_cash_pagamentos,0), COALESCE(saldo_ton,0) "
         "FROM usuarios WHERE telegram_id=?", (user_id,)
@@ -727,7 +713,6 @@ async def start(msg: types.Message):
     row = cur.fetchone()
     saldo_cash, saldo_pag, saldo_ton = row if row else (0, 0, 0)
 
-    # inventário e rendimento
     cur.execute("SELECT SUM(quantidade) FROM inventario WHERE telegram_id=?", (user_id,))
     total_animais = cur.fetchone()[0] or 0
 
@@ -872,7 +857,7 @@ async def collect_now_cb(call: types.CallbackQuery):
     )
     await call.answer()
 
-# ========= ADMIN COMANDOS (somente OWNER_TELEGRAM_ID) =========
+# ========= ADMIN COMANDOS =========
 
 @dp.message(Command("addpag"))
 async def admin_add_pag(msg: types.Message):
@@ -956,12 +941,10 @@ async def admin_show_bal(msg: types.Message):
     )
 
 
-
-
 # ===== Depósito via Crypto Pay (BRL) =====
 @dp.message(F.text == "➕ Depositar")
-async def depositar_menu(msg: types.Message, state: FSMContext):  # ← add state
-    await state.clear()  # ← limpa qualquer fluxo ativo (saque, wallet etc.)
+async def depositar_menu(msg: types.Message, state: FSMContext):
+    await state.clear()
     kb = types.ReplyKeyboardMarkup(
         keyboard=[
             [types.KeyboardButton(text="R$ 10"), types.KeyboardButton(text="R$ 25")],
@@ -971,7 +954,6 @@ async def depositar_menu(msg: types.Message, state: FSMContext):  # ← add stat
         resize_keyboard=True
     )
     await msg.answer("Escolha o valor do depósito em **reais**:", reply_markup=kb, parse_mode="Markdown")
-
 
 def _parse_reais(txt: str):
     t = txt.upper().replace("R$", "").strip().replace(",", ".")
@@ -1031,7 +1013,6 @@ async def trocar_cash(msg: types.Message):
     ).fetchone()
     saldo_pag, saldo_ton = row if row else (0, 0)
 
-
     preco_brl = get_ton_price_brl()
     cash_por_ton = max(1, int(round(preco_brl * CASH_POR_REAL)))
 
@@ -1056,7 +1037,6 @@ async def trocar_cash(msg: types.Message):
     ])
     await safe_answer(msg, texto, parse_mode="Markdown", reply_markup=kb)
 
-
 @dp.callback_query(F.data.startswith("swap:"))
 async def swap_cb(call: types.CallbackQuery):
     user_id = call.from_user.id
@@ -1075,13 +1055,11 @@ async def swap_cb(call: types.CallbackQuery):
     if amount < 20:
         await call.answer("Mínimo 20 cash.", show_alert=True)
         return
-    # >>> AQUI troca para saldo_pag (antes estava saldo_cash)
     if amount > saldo_pag:
         await call.answer("Saldo insuficiente.", show_alert=True)
         return
 
     ton_out = amount / cash_por_ton
-    # >>> AQUI debita de saldo_cash_pagamentos (antes debitava de saldo_cash)
     cur.execute(
         "UPDATE usuarios SET saldo_cash_pagamentos=saldo_cash_pagamentos-?, saldo_ton=saldo_ton+? WHERE telegram_id=?",
         (amount, ton_out, user_id)
@@ -1094,7 +1072,6 @@ async def swap_cb(call: types.CallbackQuery):
         parse_mode="Markdown"
     )
     await call.answer()
-
 
 @dp.message(lambda m: m.text and m.text.lower().startswith("trocar "))
 async def trocar_texto(msg: types.Message):
@@ -1168,13 +1145,11 @@ async def alterar_wallet_cb(cb: types.CallbackQuery, state: FSMContext):
     await state.set_state(WalletStates.changing_wallet)
     await cb.answer()
 
-# sair do fluxo de wallet e voltar ao menu
 @dp.message(StateFilter(WalletStates.waiting_wallet), F.text == "⬅️ Voltar")
 async def cancelar_wallet(msg: types.Message, state: FSMContext):
     await state.clear()
     await msg.answer("Voltei ao menu.", reply_markup=menu())
 
-# ir para Pagamento mesmo estando no fluxo de wallet
 @dp.message(StateFilter(WalletStates.waiting_wallet), F.text == "Pagamento")
 async def atalho_pagamento(msg: types.Message, state: FSMContext):
     await state.clear()
@@ -1185,7 +1160,6 @@ async def atalho_pagamento(msg: types.Message, state: FSMContext):
 async def salvar_wallet(msg: types.Message, state: FSMContext):
     txt = (msg.text or "").strip()
 
-    # atalhos durante a captura
     if txt in {"Pagamento", "Wallet TON", "⬅️ Voltar"}:
         if txt == "⬅️ Voltar":
             await state.clear()
@@ -1295,19 +1269,12 @@ async def processar_saque(msg: types.Message, state: FSMContext):
 
     except Exception as e:
         set_withdraw_status(wid, "failed")
-        # mensagem amigável
-        await msg.answer(
-            "❌ Não foi possível completar o saque agora.\n"
-            "Motivos comuns:\n"
-            "• Payout temporariamente indisponível;\n"
-            "• Valor abaixo do mínimo da API;\n"
-            "• Instabilidade momentânea.\n\n"
-            "Tente novamente mais tarde ou com um valor um pouco diferente."
-        )
+        # 🔒 mensagem genérica para o usuário
+        await msg.answer("Não foi possível concluir esta solicitação agora. Tente novamente mais tarde.")
+        # log para depuração
+        print("[payout] erro:", repr(e))
     finally:
         await state.clear()
-
-
 
 
 @dp.message(F.text == "👫 Indique & Ganhe")
@@ -1324,8 +1291,6 @@ async def indicacao(msg: types.Message):
     )
     await safe_answer(msg, texto, parse_mode="HTML")
 
-
-
 @dp.message(F.text == "❓ Ajuda/Suporte")
 async def ajuda(msg: types.Message):
     await msg.answer(
@@ -1340,28 +1305,4 @@ async def ajuda(msg: types.Message):
 
 # ========= INICIAR BOT =========
 def start_bot():
-    asyncio.create_task(dp.start_polling(bot))
-
-@app.on_event("startup")
-async def on_startup():
-    try:
-        # às vezes o Telegram demora a responder; não derrube o app por isso
-        await bot.delete_webhook(drop_pending_updates=True)
-    except Exception as e:
-        print("[startup] delete_webhook falhou (ignorando):", repr(e))
-
-    start_bot()
-    asyncio.create_task(_refresh_price_loop())
-
-@app.on_event("shutdown")
-async def on_shutdown():
-    try:
-        await bot.session.close()
-    except Exception:
-        pass
-
-
-
-# ========== FASTAPI MAIN ==========
-if __name__ == '__main__':
-    uvicorn.run("fazenda_ton_bot.bot_main:app", host="0.0.0.0", port=8000, reload=False)
+    asyncio.create_task(dp.start_polling(bot
