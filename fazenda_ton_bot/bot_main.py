@@ -6,6 +6,7 @@ import requests
 import httpx
 import re, uuid, time, os, sqlite3
 import logging
+logging.basicConfig(level=logging.INFO)
 
 
 from aiogram import Bot, Dispatcher, F, types
@@ -612,15 +613,25 @@ async def start(msg: types.Message):
 @dp.message(F.text == "💰 Meu Saldo")
 async def saldo(msg: types.Message):
     user_id = msg.from_user.id
-    cur.execute("SELECT COALESCE(saldo_cash,0), COALESCE(saldo_ton,0) FROM usuarios WHERE telegram_id=?", (user_id,))
-    row = cur.fetchone()
-    saldo_cash, saldo_ton = row if row else (0, 0)
+    cur.execute("""
+        SELECT 
+            COALESCE(saldo_cash,0)               AS cash_depositos,
+            COALESCE(saldo_cash_pagamentos,0)    AS cash_pag,
+            COALESCE(saldo_ton,0)                AS saldo_ton
+        FROM usuarios WHERE telegram_id=?
+    """, (user_id,))
+    r = cur.fetchone() or (0,0,0)
+    cash_dep, cash_pag, saldo_ton = r
+
     await msg.answer(
-        f"💸 Seu saldo em cash: `{saldo_cash:.0f}`\n"
-        f"💎 Seu saldo em TON: `{saldo_ton:.4f}`\n"
-        f"Conversão (depósito): 1 real = {CASH_POR_REAL:.0f} cash",
+        "📊 *Seus saldos*\n\n"
+        f"• 💸 Cash (depósitos / compra de animais): `{cash_dep:.0f}`\n"
+        f"• 🧾 Cash pagamentos (rendimentos): `{cash_pag:.0f}`\n"
+        f"• 💎 TON (conversões do cash pagamentos): `{saldo_ton:.6f}`\n\n"
+        f"_Obs.: Apenas o saldo TON pode ser sacado. O botão **🔄 Trocar cash por TON** usa **cash pagamentos**._",
         parse_mode="Markdown"
     )
+
 
 @dp.message(F.text == "🛒 Comprar")
 async def comprar(msg: types.Message):
@@ -698,7 +709,7 @@ async def meus_animais(msg: types.Message):
 
 
 # ===== Depósito via Crypto Pay (BRL) =====
-@dp.message(F.text == "➕ Depositar")
+@dp.message(StateFilter(None), F.text == "➕ Depositar")
 async def depositar_menu(msg: types.Message):
     kb = types.ReplyKeyboardMarkup(
         keyboard=[
@@ -718,7 +729,7 @@ def _parse_reais(txt: str):
     except:
         return None
 
-@dp.message(F.text.in_(["R$ 10","R$ 25","R$ 50","R$ 100"]))
+@dp.message(StateFilter(None), F.text.in_(["R$ 10","R$ 25","R$ 50","R$ 100"]))
 async def gerar_link_padrao(msg: types.Message):
     if not CRYPTOPAY_TOKEN:
         await msg.answer("Configuração de pagamento ausente. Avise o suporte.")
@@ -734,11 +745,11 @@ async def gerar_link_padrao(msg: types.Message):
         "Assim que o pagamento for confirmado, eu credito seus cash. ⏳"
     )
 
-@dp.message(F.text == "Outro valor (R$)")
+@dp.message(StateFilter(None), F.text == "Outro valor (R$)")
 async def outro_valor(msg: types.Message):
     await msg.answer("Envie o valor desejado em reais. Ex.: 37,90")
 
-@dp.message(lambda m: _parse_reais(m.text) is not None and "R$" not in m.text and "TON" not in m.text)
+@dp.message(StateFilter(None), lambda m: _parse_reais(m.text) is not None and "R$" not in m.text and "TON" not in m.text)
 async def gerar_link_custom(msg: types.Message):
     if not CRYPTOPAY_TOKEN:
         await msg.answer("Configuração de pagamento ausente. Avise o suporte.")
@@ -763,20 +774,20 @@ async def gerar_link_custom(msg: types.Message):
 async def trocar_cash(msg: types.Message):
     user_id = msg.from_user.id
     row = cur.execute(
-        "SELECT COALESCE(saldo_cash,0), COALESCE(saldo_ton,0) FROM usuarios WHERE telegram_id=?",
+        "SELECT COALESCE(saldo_cash_pagamentos,0), COALESCE(saldo_ton,0) FROM usuarios WHERE telegram_id=?",
         (user_id,)
     ).fetchone()
-    saldo_cash, saldo_ton = row if row else (0, 0)
+    saldo_pag, saldo_ton = row if row else (0, 0)
 
     preco_brl = get_ton_price_brl()
     cash_por_ton = max(1, int(round(preco_brl * CASH_POR_REAL)))
 
     texto = (
-        "💱 *Troca cash → TON*\n"
+        "💱 *Troca cash pagamentos → TON*\n""
         f"Preço atual (CoinGecko): `1 TON ≈ R$ {preco_brl:.2f}`\n"
-        f"Equivalência: `1 TON ≈ {cash_por_ton} cash` (1 real = {CASH_POR_REAL:.0f} cash)\n\n"
-        "Envie a quantidade que deseja converter usando os botões abaixo (mín. `20` cash)\n"
-        "_Ou digite: `trocar 250`_"
+        f"Equivalência: `1 TON ≈ {cash_por_ton} cash`\n\n"
+        f"Seu cash pagamentos disponível: `{saldo_pag:.0f}`\n\n"
+        "Escolha um valor (mín. `20` cash) ou digite: `trocar 250`"
     )
 
     kb = types.InlineKeyboardMarkup(inline_keyboard=[
@@ -796,33 +807,34 @@ async def trocar_cash(msg: types.Message):
 async def swap_cb(call: types.CallbackQuery):
     user_id = call.from_user.id
     row = cur.execute(
-        "SELECT COALESCE(saldo_cash,0), COALESCE(saldo_ton,0) FROM usuarios WHERE telegram_id=?",
+        "SELECT COALESCE(saldo_cash_pagamentos,0), COALESCE(saldo_ton,0) FROM usuarios WHERE telegram_id=?",
         (user_id,)
     ).fetchone()
-    saldo_cash, saldo_ton = row if row else (0, 0)
+    saldo_pag, saldo_ton = row if row else (0, 0)
 
     preco_brl = get_ton_price_brl()
     cash_por_ton = max(1, int(round(preco_brl * CASH_POR_REAL)))
 
     _, amount_s = call.data.split(":", 1)
-    amount = saldo_cash if amount_s == "all" else int(amount_s)
+    amount = saldo_pag if amount_s == "all" else int(amount_s)
 
     if amount < 20:
         await call.answer("Mínimo 20 cash.", show_alert=True)
         return
-    if amount > saldo_cash:
-        await call.answer("Saldo insuficiente.", show_alert=True)
+    if amount > saldo_pag:
+        await call.answer("Saldo de pagamentos insuficiente.", show_alert=True)
         return
 
     ton_out = amount / cash_por_ton
     cur.execute(
-        "UPDATE usuarios SET saldo_cash=saldo_cash-?, saldo_ton=saldo_ton+? WHERE telegram_id=?",
+        "UPDATE usuarios SET saldo_cash_pagamentos=saldo_cash_pagamentos-?, saldo_ton=saldo_ton+? WHERE telegram_id=?",
         (amount, ton_out, user_id)
     )
+
     con.commit()
 
     await call.message.answer(
-        f"✅ Convertidos `{amount}` cash → `{ton_out:.5f}` TON\n"
+        f"✅ Convertidos `{amount}` cash pagamentos → `{ton_out:.5f}` TON\n"
         f"`1 TON = {cash_por_ton} cash` (≈ R$ {preco_brl:.2f}).",
         parse_mode="Markdown"
     )
@@ -839,16 +851,16 @@ async def trocar_texto(msg: types.Message):
 
     user_id = msg.from_user.id
     row = cur.execute(
-        "SELECT COALESCE(saldo_cash,0), COALESCE(saldo_ton,0) FROM usuarios WHERE telegram_id=?",
+        "SELECT COALESCE(saldo_cash_pagamentos,0), COALESCE(saldo_ton,0) FROM usuarios WHERE telegram_id=?",
         (user_id,)
     ).fetchone()
-    saldo_cash, saldo_ton = row if row else (0, 0)
+    saldo_pag, saldo_ton = row if row else (0, 0)
 
     if amount < 20:
         await msg.answer("Mínimo 20 cash.")
         return
-    if amount > saldo_cash:
-        await msg.answer("Saldo insuficiente.")
+    if amount > saldo_pag:
+        await msg.answer("Saldo de pagamentos insuficiente.")
         return
 
     preco_brl = get_ton_price_brl()
@@ -856,9 +868,17 @@ async def trocar_texto(msg: types.Message):
     ton_out = amount / cash_por_ton
 
     cur.execute(
-        "UPDATE usuarios SET saldo_cash=saldo_cash-?, saldo_ton=saldo_ton+? WHERE telegram_id=?",
+        "UPDATE usuarios SET saldo_cash_pagamentos=saldo_cash_pagamentos-?, saldo_ton=saldo_ton+? WHERE telegram_id=?",
         (amount, ton_out, user_id)
     )
+    con.commit()
+
+    await msg.answer(
+        f"✅ Convertidos `{amount}` cash pagamentos → `{ton_out:.5f}` TON\n"
+        f"`1 TON = {cash_por_ton} cash` (≈ R$ {preco_brl:.2f}).",
+        parse_mode="Markdown"
+    )
+
     con.commit()
 
     await msg.answer(
@@ -1037,6 +1057,99 @@ async def ajuda(msg: types.Message):
         "• 🏦 Sacar TON para sua carteira\n\n"
         "Qualquer dúvida, fale conosco!"
     )
+
+    # ===== Admin commands =====
+def _target_user_id(msg: types.Message, parts: list) -> int:
+    # prioridade: reply > argumento [user_id] > próprio
+    if msg.reply_to_message:
+        return msg.reply_to_message.from_user.id
+    if len(parts) >= 3 and str(parts[2]).isdigit():
+        return int(parts[2])
+    if len(parts) >= 2 and str(parts[1]).isdigit():
+        return int(parts[1])
+    return msg.from_user.id
+
+def _only_admin(msg: types.Message) -> bool:
+    return is_admin(msg.from_user.id)
+
+@dp.message(Command("saldo"))
+async def cmd_saldo(msg: types.Message):
+    if not _only_admin(msg):
+        return
+    parts = (msg.text or "").split()
+    uid = _target_user_id(msg, parts)
+    r = cur.execute("""
+        SELECT COALESCE(saldo_cash,0), COALESCE(saldo_cash_pagamentos,0), COALESCE(saldo_ton,0)
+        FROM usuarios WHERE telegram_id=?
+    """, (uid,)).fetchone()
+    if not r:
+        await msg.answer(f"Usuário {uid} não encontrado.")
+        return
+    cash_dep, cash_pag, ton = r
+    await msg.answer(
+        f"UID `{uid}`\n"
+        f"• cash depósitos: `{cash_dep:.0f}`\n"
+        f"• cash pagamentos: `{cash_pag:.0f}`\n"
+        f"• TON: `{ton:.6f}`",
+        parse_mode="Markdown"
+    )
+
+@dp.message(Command("addpag"))
+async def cmd_addpag(msg: types.Message):
+    if not _only_admin(msg):
+        return
+    parts = (msg.text or "").split()
+    if len(parts) < 2:
+        await msg.answer("Uso: /addpag <valor> [user_id] (ou responda a uma mensagem do usuário)")
+        return
+    try:
+        val = float(parts[1])
+    except:
+        await msg.answer("Valor inválido.")
+        return
+    uid = _target_user_id(msg, parts)
+    cur.execute("INSERT OR IGNORE INTO usuarios(telegram_id,criado_em) VALUES(?,?)", (uid, datetime.now().isoformat()))
+    cur.execute("UPDATE usuarios SET saldo_cash_pagamentos=COALESCE(saldo_cash_pagamentos,0)+? WHERE telegram_id=?", (val, uid))
+    con.commit()
+    await msg.answer(f"OK: +{val} ao *cash pagamentos* de `{uid}`.", parse_mode="Markdown")
+
+@dp.message(Command("adddep"))
+async def cmd_adddep(msg: types.Message):
+    if not _only_admin(msg):
+        return
+    parts = (msg.text or "").split()
+    if len(parts) < 2:
+        await msg.answer("Uso: /adddep <valor> [user_id]")
+        return
+    try:
+        val = float(parts[1])
+    except:
+        await msg.answer("Valor inválido.")
+        return
+    uid = _target_user_id(msg, parts)
+    cur.execute("INSERT OR IGNORE INTO usuarios(telegram_id,criado_em) VALUES(?,?)", (uid, datetime.now().isoformat()))
+    cur.execute("UPDATE usuarios SET saldo_cash=COALESCE(saldo_cash,0)+? WHERE telegram_id=?", (val, uid))
+    con.commit()
+    await msg.answer(f"OK: +{val} ao *cash depósitos* de `{uid}`.", parse_mode="Markdown")
+
+@dp.message(Command("addton"))
+async def cmd_addton(msg: types.Message):
+    if not _only_admin(msg):
+        return
+    parts = (msg.text or "").split()
+    if len(parts) < 2:
+        await msg.answer("Uso: /addton <valor> [user_id]")
+        return
+    try:
+        val = float(parts[1])
+    except:
+        await msg.answer("Valor inválido.")
+        return
+    uid = _target_user_id(msg, parts)
+    cur.execute("INSERT OR IGNORE INTO usuarios(telegram_id,criado_em) VALUES(?,?)", (uid, datetime.now().isoformat()))
+    cur.execute("UPDATE usuarios SET saldo_ton=COALESCE(saldo_ton,0)+? WHERE telegram_id=?", (val, uid))
+    con.commit()
+    await msg.answer(f"OK: +{val} TON para `{uid}`.", parse_mode="Markdown")
 
 
 # ========= INICIAR BOT =========
