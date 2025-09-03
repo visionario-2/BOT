@@ -273,11 +273,9 @@ REF_PCT = float(os.getenv("REF_PCT", "4"))
 
 
 # ========= BOT / APP ==========
-from aiogram.client.session.aiohttp import AiohttpSession
 from aiohttp import ClientTimeout  # <-- adicione esta importação
 
-_session = AiohttpSession(timeout=ClientTimeout(total=10))
-bot = Bot(token=TOKEN, session=_session)
+bot = Bot(token=TOKEN)
 
 dp = Dispatcher()
 
