@@ -1309,11 +1309,23 @@ def start_bot():
 
 @app.on_event("startup")
 async def on_startup():
-    await bot.delete_webhook(drop_pending_updates=True)
+    try:
+        # às vezes o Telegram demora a responder; não derrube o app por isso
+        await bot.delete_webhook(drop_pending_updates=True)
+    except Exception as e:
+        print("[startup] delete_webhook falhou (ignorando):", repr(e))
+
     start_bot()
     asyncio.create_task(_refresh_price_loop())
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    try:
+        await bot.session.close()
+    except Exception:
+        pass
 
 
 # ========== FASTAPI MAIN ==========
 if __name__ == '__main__':
-    uvicorn.run("fazenda_ton_bot.bot_main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("fazenda_ton_bot.bot_main:app", host="0.0.0.0", port=8000, reload=False)
