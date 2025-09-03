@@ -508,6 +508,33 @@ def verify_cryptopay_signature(body_bytes: bytes, signature_hex: str, token: str
     except Exception:
         return False
 
+async def cryptopay_get_app_ton_balance() -> float:
+    """
+    Retorna o saldo TON disponível no *APP* (Dentate Owl App),
+    igual ao que você vê no botão 'My Apps' do @CryptoBot.
+    """
+    headers = {
+        "Crypto-Pay-API-Token": CRYPTOPAY_TOKEN,
+        "Accept": "application/json",
+    }
+    async with httpx.AsyncClient(timeout=20) as cli:
+        r = await cli.post("https://pay.crypt.bot/api/getBalance", headers=headers, json={})
+        r.raise_for_status()
+        data = r.json()
+        if not data.get("ok"):
+            raise CryptoPayError(f"getBalance falhou: {data}")
+        items = data["result"] or []
+        # procura TON na lista
+        for it in items:
+            code = (it.get("currency_code") or it.get("asset") or it.get("code") or "").upper()
+            if code == "TON":
+                val = it.get("available") or it.get("balance") or it.get("available_balance") or 0
+                try:
+                    return float(val)
+                except Exception:
+                    return 0.0
+        return 0.0
+
 
 # ========= RENDIMENTO / COLETA MANUAL =========
 DAY_SECS = 86400.0
@@ -1215,7 +1242,7 @@ async def processar_saque(msg: types.Message, state: FSMContext):
         await state.clear()
         return await msg.answer("Wallet não encontrada. Cadastre sua **Wallet TON** e tente novamente.")
 
-    # 3) checa se há TON suficiente
+    # 3) checa se há TON suficiente no saldo *interno* do usuário
     _, _, saldo_ton = get_balances(msg.from_user.id)
     if saldo_ton + 1e-9 < amount_ton:
         await state.clear()
@@ -1225,24 +1252,40 @@ async def processar_saque(msg: types.Message, state: FSMContext):
             parse_mode="Markdown"
         )
 
-    # 4) cria registro e tenta pagar
+    # 4) checa se o *APP* (Dentate Owl) tem TON suficiente para pagar
+    await msg.answer("⏳ Verificando saldo do app no Crypto Pay…")
+    try:
+        app_ton = await cryptopay_get_app_ton_balance()
+    except Exception as e:
+        app_ton = 0.0
+    if amount_ton > app_ton + 1e-9:
+        await state.clear()
+        return await msg.answer(
+            "❌ Saldo insuficiente no APP (Crypto Pay) para realizar o payout agora.\n"
+            f"Disponível no APP: `{app_ton:.6f}` TON\n"
+            f"Solicitado: `{amount_ton:.6f}` TON\n\n"
+            "Tente um valor menor ou aguarde o administrador abastecer o App.",
+            parse_mode="Markdown"
+        )
+
+    # 5) cria registro e tenta pagar
     idemp = new_idempotency_key(msg.from_user.id)
     wid = create_withdraw(msg.from_user.id, requested_ton=amount_ton, wallet=wallet, idemp=idemp)
     set_withdraw_status(wid, "processing")
-    await msg.answer("⏳ Processando seu saque…")
+    await msg.answer("🔁 Processando seu saque…")
 
     try:
-        # 4.1 primeiro envia o payout
+        # 5.1 aciona o payout do App direto para a carteira do usuário
         await cryptopay_transfer_ton_to_address(amount_ton, wallet, idemp)
 
-        # 4.2 se deu certo, debita do saldo TON
+        # 5.2 se deu certo, debita do saldo TON interno
         with db_conn() as c:
             c.execute(
                 "UPDATE usuarios SET saldo_ton = saldo_ton - ? WHERE telegram_id=?",
                 (amount_ton, msg.from_user.id)
             )
 
-        # 4.3 finaliza
+        # 5.3 finaliza
         set_withdraw_status(wid, "done")
         await msg.answer(
             f"✅ Saque enviado!\nValor: {amount_ton:.6f} TON\nCarteira: `{wallet}`",
@@ -1250,15 +1293,19 @@ async def processar_saque(msg: types.Message, state: FSMContext):
         )
 
     except Exception as e:
-        # falhou → não mexe em saldo
         set_withdraw_status(wid, "failed")
+        # mensagem amigável
         await msg.answer(
-            "❌ Não foi possível completar o saque agora (payout indisponível). "
-            "Tente novamente mais tarde."
+            "❌ Não foi possível completar o saque agora.\n"
+            "Motivos comuns:\n"
+            "• Payout temporariamente indisponível;\n"
+            "• Valor abaixo do mínimo da API;\n"
+            "• Instabilidade momentânea.\n\n"
+            "Tente novamente mais tarde ou com um valor um pouco diferente."
         )
-
     finally:
         await state.clear()
+
 
 
 
