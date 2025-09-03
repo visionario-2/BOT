@@ -5,6 +5,8 @@ import hmac
 import requests
 import httpx
 import re, uuid, time, os, sqlite3
+import logging
+
 
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
@@ -149,6 +151,11 @@ BOT_USERNAME = os.getenv("BOT_USERNAME", "SEU_BOT_USERNAME")
 DB_PATH = os.getenv("DB_PATH", "/data/db.sqlite3")
 print("DB_PATH em uso:", DB_PATH)
 
+db_dir = os.path.dirname(DB_PATH)
+if db_dir:
+    os.makedirs(db_dir, exist_ok=True)
+
+
 def _column_exists(conn, table, column):
     cur = conn.execute(f"PRAGMA table_info({table})")
     return any(r[1] == column for r in cur.fetchall())
@@ -265,7 +272,12 @@ REF_PCT = float(os.getenv("REF_PCT", "4"))
 
 
 # ========= BOT / APP ==========
-bot = Bot(token=TOKEN)
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiohttp import ClientTimeout
+
+_session = AiohttpSession(timeout=ClientTimeout(total=10))
+bot = Bot(token=TOKEN, session=_session)
+
 dp = Dispatcher()
 
 app = FastAPI()
@@ -402,16 +414,21 @@ class CryptoPayError(Exception):
 
 async def cryptopay_transfer_ton_to_address(amount_ton: float, ton_address: str, idempotency_key: str):
     headers = {
-        "Crypto-Pay-API-Token": CRYPTOPAY_TOKEN,
-        "Idempotency-Key": idempotency_key
+        "Crypto-Pay-API-Token": CRYPTOPAY_TOKEN
     }
-    payload = {"asset": "TON", "amount": str(amount_ton), "address": ton_address}
+    payload = {
+        "asset": "TON",
+        "amount": str(amount_ton),
+        "address": ton_address,
+        "spend_id": idempotency_key  # idempotência correta
+    }
     async with httpx.AsyncClient(timeout=30) as cli:
         r = await cli.post("https://pay.crypt.bot/api/createPayout", headers=headers, json=payload)
         data = r.json() if r.headers.get("content-type","").startswith("application/json") else {"ok": False, "description": r.text}
         if r.status_code != 200 or not data.get("ok"):
             raise CryptoPayError(f"createPayout falhou: {data}")
         return data["result"]
+
 
 async def cryptopay_transfer_ton_to_user(amount_ton: float, crypto_user_id: int, idempotency_key: str):
     headers = {
@@ -1024,13 +1041,27 @@ async def ajuda(msg: types.Message):
 
 
 # ========= INICIAR BOT =========
-def start_bot():
-    asyncio.create_task(dp.start_polling(bot))
+async def _run_polling_forever():
+    backoff = 1
+    while True:
+        try:
+            logging.info("[polling] iniciando polling…")
+            await dp.start_polling(bot)
+        except Exception as e:
+            logging.error("[polling] caiu: %s", e)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 30)
+
 
 @app.on_event("startup")
 async def on_startup():
-    await bot.delete_webhook(drop_pending_updates=True)
-    start_bot()
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+        logging.info("[startup] webhook deletado")
+    except Exception as e:
+        logging.warning("[startup] delete_webhook falhou, mas vou ignorar: %s", e)
+
+    asyncio.create_task(_run_polling_forever())
     asyncio.create_task(_refresh_price_loop())
 
 
