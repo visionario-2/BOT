@@ -1305,4 +1305,15 @@ async def ajuda(msg: types.Message):
 
 # ========= INICIAR BOT =========
 def start_bot():
-    asyncio.create_task(dp.start_polling(bot
+    asyncio.create_task(dp.start_polling(bot))
+
+@app.on_event("startup")
+async def on_startup():
+    await bot.delete_webhook(drop_pending_updates=True)
+    start_bot()
+    asyncio.create_task(_refresh_price_loop())
+
+
+# ========== FASTAPI MAIN ==========
+if __name__ == '__main__':
+    uvicorn.run("fazenda_ton_bot.bot_main:app", host="0.0.0.0", port=8000, reload=True)
