@@ -290,18 +290,30 @@ async def healthz():
     return {"ok": True}
 
 
-# ========= CRYPTO PAY HELPERS ==========
+# ========= CRYPTO PAY HELPERS =========
 def cryptopay_call(method: str, payload: dict):
-    r = requests.post(
-        f"{CRYPTOPAY_API}/{method}",
-        json=payload,
-        headers={"Crypto-Pay-API-Token": CRYPTOPAY_TOKEN},
-        timeout=30
-    )
-    data = r.json()
+    try:
+        r = requests.post(
+            f"{CRYPTOPAY_API}/{method}",
+            json=payload,
+            headers={"Crypto-Pay-API-Token": CRYPTOPAY_TOKEN},
+            timeout=30
+        )
+        ct = r.headers.get("content-type","")
+        data = r.json() if "application/json" in ct else {"ok": False, "description": r.text}
+    except Exception as e:
+        raise RuntimeError(f"CryptoPay network error on {method}: {e}")
+
     if not data.get("ok"):
-        raise RuntimeError(f"CryptoPay error: {data}")
+        # devolve detalhe legível pra gente logar/ver no chat
+        raise RuntimeError(f"CryptoPay error on {method}: {data}")
     return data["result"]
+
+
+def get_app_balances():
+    """Obtém os saldos do App (TON/USDT etc.). Útil pra depurar payout."""
+    return cryptopay_call("getBalance", {})
+
 
 def criar_invoice_cryptopay(user_id: int, valor_reais: float) -> str:
     payload = {
@@ -411,22 +423,25 @@ def set_withdraw_status(wid: int, status: str):
 class CryptoPayError(Exception):
     pass
 
+
 async def cryptopay_transfer_ton_to_address(amount_ton: float, ton_address: str, idempotency_key: str):
-    headers = {
-        "Crypto-Pay-API-Token": CRYPTOPAY_TOKEN
-    }
+    """
+    Envia TON para um endereço on-chain usando createPayout.
+    Usa a helper síncrona cryptopay_call com tratamento de erro padronizado.
+    """
     payload = {
         "asset": "TON",
-        "amount": str(amount_ton),
+        "amount": f"{amount_ton:.9f}",   # string
         "address": ton_address,
-        "spend_id": idempotency_key  # idempotência correta
+        "spend_id": idempotency_key
     }
-    async with httpx.AsyncClient(timeout=30) as cli:
-        r = await cli.post("https://pay.crypt.bot/api/createPayout", headers=headers, json=payload)
-        data = r.json() if r.headers.get("content-type","").startswith("application/json") else {"ok": False, "description": r.text}
-        if r.status_code != 200 or not data.get("ok"):
-            raise CryptoPayError(f"createPayout falhou: {data}")
-        return data["result"]
+    try:
+        res = cryptopay_call("createPayout", payload)
+        return res
+    except Exception as e:
+        # propaga erro amigável para cair no handler e recreditar saldo
+        raise CryptoPayError(str(e))
+
 
 
 async def cryptopay_transfer_ton_to_user(amount_ton: float, crypto_user_id: int, idempotency_key: str):
@@ -455,7 +470,16 @@ def verify_cryptopay_signature(body_bytes: bytes, signature_hex: str, token: str
 # ========= WEBHOOK CRYPTO PAY =========
 @app.post("/webhook/cryptopay")
 async def cryptopay_webhook(request: Request):
+    signature = request.headers.get("Crypto-Pay-Signature", "")
+    body = await request.body()
+    if not verify_cryptopay_signature(body, signature, CRYPTOPAY_TOKEN):
+        logging.warning("[cryptopay] assinatura inválida")
+        return {"ok": False}
+
     data = await request.json()
+
+
+
 
     if data.get("update_type") != "invoice_paid":
         return {"ok": True}
@@ -990,13 +1014,36 @@ async def processar_saque(msg: types.Message, state: FSMContext):
     except:
         return await msg.answer("Não entendi. Envie apenas o **número** (ex.: 1.25).")
 
+    # mínimo de saque
+    if amount_ton < 0.1:
+        return await msg.answer("Valor mínimo para saque: 0.1 TON.")
+
     user_id = msg.from_user.id
     wallet = get_wallet(user_id)
     if not wallet:
         await state.clear()
         return await msg.answer("Wallet não encontrada. Cadastre sua **Wallet TON** e tente novamente.")
 
-    # Checar e reservar saldo TON (não mexe em 'cash pagamentos')
+    # 1) Checar saldo do App (lado Crypto Pay) ANTES de reservar o saldo do usuário
+    try:
+        balances = get_app_balances()   # [{'currency':'TON','available':'1.2345', ...}, ...]
+        ton_avail = 0.0
+        for b in balances:
+            if b.get("currency") == "TON":
+                try:
+                    ton_avail = float(b.get("available", 0))
+                except:
+                    pass
+        if ton_avail + 1e-9 < amount_ton:
+            await state.clear()
+            return await msg.answer(
+                "⚠️ O cofre do app não tem TON suficiente no momento. "
+                "Tente um valor menor ou aguarde reabastecimento."
+            )
+    except Exception as e:
+        logging.warning(f"[payout] get_app_balances falhou: {e}")
+
+    # 2) Checar e reservar saldo TON do usuário
     with db_conn() as c:
         row = c.execute("SELECT saldo_ton FROM usuarios WHERE telegram_id=?", (user_id,)).fetchone()
         saldo_ton = row["saldo_ton"] if row else 0.0
@@ -1006,7 +1053,7 @@ async def processar_saque(msg: types.Message, state: FSMContext):
                 f"Saldo TON insuficiente para sacar {amount_ton:.6f} TON. "
                 f"Seu saldo é {saldo_ton:.6f} TON."
             )
-        # reserva (debita) o TON antes de enviar o payout
+        # reserva (debita) o TON antes do payout
         c.execute("UPDATE usuarios SET saldo_ton = saldo_ton - ? WHERE telegram_id=?", (amount_ton, user_id))
 
     idemp = new_idempotency_key(user_id)
@@ -1021,17 +1068,20 @@ async def processar_saque(msg: types.Message, state: FSMContext):
             f"✅ Saque enviado!\nValor: {amount_ton:.6f} TON\nCarteira: `{wallet}`",
             parse_mode="Markdown"
         )
-    except Exception:
+    except Exception as e:
         # rollback do TON em caso de falha no payout
         with db_conn() as c:
             c.execute("UPDATE usuarios SET saldo_ton = saldo_ton + ? WHERE telegram_id=?", (amount_ton, user_id))
         set_withdraw_status(wid, "failed")
         await msg.answer(
-            "❌ Não foi possível completar o saque agora (payout indisponível). "
-            "O valor foi estornado para seu saldo TON. Tente novamente mais tarde."
+            "❌ Não foi possível completar o saque agora.\n"
+            f"Detalhe: `{str(e)[:200]}`\n"
+            "O valor foi estornado para seu saldo TON. Tente novamente mais tarde.",
+            parse_mode="Markdown"
         )
     finally:
         await state.clear()
+
 
 
 
@@ -1102,6 +1152,22 @@ async def add_ton(msg: types.Message):
     cur.execute("UPDATE usuarios SET saldo_ton=COALESCE(saldo_ton,0)+? WHERE telegram_id=?", (valor, uid))
     con.commit()
     await msg.answer(f"✅ Adicionado {valor} TON ao usuário {uid}")
+    
+
+@dp.message(Command("appsaldo"))
+async def app_saldo(msg: types.Message):
+    if not is_admin(msg.from_user.id):
+        return
+    try:
+        bals = get_app_balances()
+        texto = "💼 Saldos do App:\n" + "\n".join(
+            f"{b.get('currency')}: disponível {b.get('available')} | bloqueado {b.get('locked')}"
+            for b in bals
+        )
+        await msg.answer(texto)
+    except Exception as e:
+        await msg.answer(f"Erro ao obter saldos do app: {e}")
+
 
 
 # ========= INICIAR BOT =========
