@@ -362,6 +362,22 @@ def normalize_wallet(addr: str) -> str:
 def new_idempotency_key(user_id: int) -> str:
     return f"wd-{user_id}-{int(time.time())}-{uuid.uuid4().hex[:8]}"
 
+def _balance_code(b: dict) -> str:
+    """
+    Extrai o código do ativo de um item do getBalance, mesmo que a API use
+    um nome de campo diferente. Normaliza para maiúsculas.
+    """
+    return (
+        (b.get("currency")
+         or b.get("asset")
+         or b.get("currency_code")
+         or b.get("code")
+         or b.get("ticker")
+         or b.get("symbol")
+         or "")
+        .upper()
+    )
+
 def db_conn():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -992,22 +1008,25 @@ async def processar_saque(msg: types.Message, state: FSMContext):
     # 1) Checar saldo do App ANTES de reservar o saldo do usuário
     try:
         balances = get_app_balances()
-        ton_avail = 0.0
+        ton_avail, ton_locked = 0.0, 0.0
         for b in balances:
-            if b.get("currency") == "TON":
-                try:
-                    ton_avail = float(b.get("available", 0))
-                except:
-                    pass
+            code = _balance_code(b)  # <-- usa o helper novo
+            if code == "TON":
+                ton_avail = float(b.get("available") or 0)
+                ton_locked = float(b.get("locked") or 0)
+                break
+
         if ton_avail + 1e-9 < amount_ton:
             await state.clear()
             return await msg.answer(
-                "⚠️ O cofre do app não tem TON suficiente no momento. "
+                f"⚠️ O cofre do app não tem TON suficiente.\n"
+                f"Disponível: {ton_avail:.6f} TON | Bloqueado: {ton_locked:.6f} TON\n"
                 "Tente um valor menor ou aguarde reabastecimento."
             )
     except Exception as e:
         logging.warning(f"[payout] get_app_balances falhou: {e}")
 
+    
     # 2) Checar e reservar saldo TON do usuário
     with db_conn() as c:
         row = c.execute("SELECT saldo_ton FROM usuarios WHERE telegram_id=?", (user_id,)).fetchone()
@@ -1119,11 +1138,15 @@ async def app_saldo(msg: types.Message):
         return
     try:
         bals = get_app_balances()
-        texto = "💼 Saldos do App:\n" + "\n".join(
-            f"{b.get('currency')}: disponível {b.get('available')} | bloqueado {b.get('locked')}"
-            for b in bals
-        )
+        linhas = []
+        for b in bals:
+            code = _balance_code(b) or "?"
+            avail = b.get("available") or 0
+            locked = b.get("locked") or 0
+            linhas.append(f"{code}: disponível {avail} | bloqueado {locked}")
+        texto = "💼 Saldos do App:\n" + "\n".join(linhas)
         await msg.answer(texto)
+ 
     except Exception as e:
         await msg.answer(f"Erro ao obter saldos do app: {e}")
 
