@@ -448,10 +448,16 @@ def verify_cryptopay_signature(body: bytes, signature: str, token: str) -> bool:
 # ========= WEBHOOK CRYPTO PAY =========
 @app.post("/webhook/cryptopay")
 async def cryptopay_webhook(request: Request):
-    signature = request.headers.get("Crypto-Pay-Signature", "")
-    body = await request.body()
-    logging.info(f"[cryptopay] webhook recebido len={len(body)} sig={signature[:16]}...")
+    # 1) pegar o header correto (com fallback em minúsculas)
+    signature = (
+        request.headers.get("Crypto-Pay-API-Signature")
+        or request.headers.get("crypto-pay-api-signature")
+        or ""
+    )
 
+    body = await request.body()
+
+    # 2) verifica assinatura (usa SHA256(token) como chave do HMAC)
     if not verify_cryptopay_signature(body, signature, CRYPTOPAY_TOKEN):
         logging.warning("[cryptopay] assinatura inválida")
         return {"ok": False}
