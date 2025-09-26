@@ -455,6 +455,15 @@ async def cryptopay_transfer_ton_to_user(amount_ton: float, crypto_user_id: int,
             raise CryptoPayError(f"transfer falhou: {data}")
         return data["result"]
 
+def criar_check_ton(amount_ton: float) -> dict:
+    """
+    Fallback de saque: cria um Check do CryptoBot com TON.
+    Retorna o dicionário do result (contém 'check_url').
+    """
+    payload = {"asset": "TON", "amount": f"{amount_ton:.9f}"}
+    return cryptopay_call("createCheck", payload)
+
+
 # ===== Assinatura do webhook (oficial) =====
 def verify_cryptopay_signature(body: bytes, signature: str, token: str) -> bool:
     # HMAC-SHA256(body, sha256(token)) — conforme docs do Crypto Pay
@@ -1045,24 +1054,59 @@ async def processar_saque(msg: types.Message, state: FSMContext):
     await msg.answer("⏳ Processando seu saque…")
 
     try:
+        # 3) Payout direto (se habilitado)
         await cryptopay_transfer_ton_to_address(amount_ton, wallet, idemp)
         set_withdraw_status(wid, "done")
         await msg.answer(
             f"✅ Saque enviado!\nValor: {amount_ton:.6f} TON\nCarteira: `{wallet}`",
             parse_mode="Markdown"
         )
-    except Exception as e:
-        with db_conn() as c:
-            c.execute("UPDATE usuarios SET saldo_ton = saldo_ton + ? WHERE telegram_id=?", (amount_ton, user_id))
-        set_withdraw_status(wid, "failed")
-        await msg.answer(
-            "❌ Não foi possível completar o saque agora.\n"
-            f"Detalhe: `{str(e)[:200]}`\n"
-            "O valor foi estornado para seu saldo TON. Tente novamente mais tarde.",
-            parse_mode="Markdown"
-        )
+
+    except CryptoPayError as e:
+        err = str(e)
+        # 4) se não houver payouts habilitados → fallback: criar Check
+        if "METHOD_NOT_FOUND" in err or "createPayout" in err:
+            try:
+                chk = criar_check_ton(amount_ton)
+                set_withdraw_status(wid, "done")
+                check_url = chk.get("check_url") or chk.get("link") or ""
+                await msg.answer(
+                    "✅ *Saque criado como Check do CryptoBot*.\n\n"
+                    "Clique no link abaixo para resgatar o TON na sua carteira do CryptoBot e, de lá, sacar para qualquer endereço on-chain:\n"
+                    f"{check_url}",
+                    parse_mode="Markdown"
+                )
+            except Exception as ee:
+                # falhou até o fallback → estorna
+                with db_conn() as c:
+                    c.execute(
+                        "UPDATE usuarios SET saldo_ton = saldo_ton + ? WHERE telegram_id=?",
+                        (amount_ton, user_id)
+                    )
+                set_withdraw_status(wid, "failed")
+                await msg.answer(
+                    "❌ Não foi possível completar o saque agora (fallback para Check falhou).\n"
+                    f"Detalhe: `{str(ee)[:200]}`\n"
+                    "O valor foi estornado para seu saldo TON. Tente novamente mais tarde.",
+                    parse_mode="Markdown"
+                )
+        else:
+            # outro erro qualquer → estorna
+            with db_conn() as c:
+                c.execute(
+                    "UPDATE usuarios SET saldo_ton = saldo_ton + ? WHERE telegram_id=?",
+                    (amount_ton, user_id)
+                )
+            set_withdraw_status(wid, "failed")
+            await msg.answer(
+                "❌ Não foi possível completar o saque agora.\n"
+                f"Detalhe: `{err[:200]}`\n"
+                "O valor foi estornado para seu saldo TON. Tente novamente mais tarde.",
+                parse_mode="Markdown"
+            )
     finally:
         await state.clear()
+
 
 @dp.message(F.text == "👫 Indique & Ganhe")
 async def indicacao(msg: types.Message):
