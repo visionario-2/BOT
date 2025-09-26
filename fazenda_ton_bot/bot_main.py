@@ -348,6 +348,7 @@ class WalletStates(StatesGroup):
 class WithdrawStates(StatesGroup):
     waiting_amount_ton = State()
 
+    
 # === UTILS ===
 WALLET_RE = re.compile(r'^[UE]Q[A-Za-z0-9_-]{45,}$')
 
