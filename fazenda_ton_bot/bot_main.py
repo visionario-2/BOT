@@ -912,6 +912,16 @@ async def check_status_cb(call: types.CallbackQuery):
     chk_url   = row["check_url"] or ""
     requested = row["requested_ton"]
 
+    # tenta recuperar o hash a partir da URL, se não estiver salvo
+    if not chk_hash and chk_url:
+        m = re.search(r'check_([A-Za-z0-9]+)', chk_url)
+        if m:
+            chk_hash = m.group(1)
+            # persiste para as próximas consultas
+            with db_conn() as c:
+                c.execute("UPDATE withdrawals SET check_hash=? WHERE id=?", (chk_hash, wid))
+    
+    
     if not chk_hash:
         return await call.answer("Este saque não é via Check.", show_alert=True)
 
@@ -1156,7 +1166,7 @@ async def processar_saque(msg: types.Message, state: FSMContext):
                 )
                 check_hash = chk.get("hash") or ""
 
-                # salvar info do check e status "pending_claim"
+                # salvar info do check e status "processing"
                 with db_conn() as c:
                     c.execute(
                         "UPDATE withdrawals SET status=?, check_hash=?, check_url=? WHERE id=?",
