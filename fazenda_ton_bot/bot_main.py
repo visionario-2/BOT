@@ -237,13 +237,8 @@ def ensure_schema():
             conn.execute("ALTER TABLE usuarios ADD COLUMN saldo_cash_pagamentos REAL DEFAULT 0.0")
         if not _column_exists(conn, "usuarios", "saldo_ton"):
             conn.execute("ALTER TABLE usuarios ADD COLUMN saldo_ton REAL DEFAULT 0.0")
-        if not _column_exists(conn, "withdrawals", "check_hash"):
-            conn.execute("ALTER TABLE withdrawals ADD COLUMN check_hash TEXT")
-        if not _column_exists(conn, "withdrawals", "check_url"):
-            conn.execute("ALTER TABLE withdrawals ADD COLUMN check_url TEXT")
-        if not _column_exists(conn, "withdrawals", "tx_id"):
-            conn.execute("ALTER TABLE withdrawals ADD COLUMN tx_id TEXT")
 
+        # 1) garante a tabela primeiro
         conn.execute("""
         CREATE TABLE IF NOT EXISTS withdrawals (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -256,9 +251,19 @@ def ensure_schema():
           updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
         """)
+
+        # 2) depois adiciona colunas novas, se faltarem
+        if not _column_exists(conn, "withdrawals", "check_hash"):
+            conn.execute("ALTER TABLE withdrawals ADD COLUMN check_hash TEXT")
+        if not _column_exists(conn, "withdrawals", "check_url"):
+            conn.execute("ALTER TABLE withdrawals ADD COLUMN check_url TEXT")
+        if not _column_exists(conn, "withdrawals", "tx_id"):
+            conn.execute("ALTER TABLE withdrawals ADD COLUMN tx_id TEXT")
+
         conn.commit()
     finally:
         conn.close()
+
 
 # cria tudo primeiro, depois prossegue
 init_db()
@@ -1155,7 +1160,7 @@ async def processar_saque(msg: types.Message, state: FSMContext):
                 with db_conn() as c:
                     c.execute(
                         "UPDATE withdrawals SET status=?, check_hash=?, check_url=? WHERE id=?",
-                        ("pending_claim", check_hash, link, wid)
+                        ("processing", check_hash, link, wid)
                     )
 
 
@@ -1194,18 +1199,7 @@ async def processar_saque(msg: types.Message, state: FSMContext):
                     reply_markup=kb
                 )
 
-
-                # 3) envie um botão com o link (evita problemas de parse_mode)
-                kb = types.InlineKeyboardMarkup(
-                    inline_keyboard=[[types.InlineKeyboardButton(text="🔗 Resgatar no @CryptoBot", url=link)]]
-                )
-                await msg.answer(
-                    "✅ Saque criado como *Check do CryptoBot*.\n\n"
-                    "Toque no botão abaixo para resgatar o TON na sua carteira do @CryptoBot.\n"
-                    "Depois você pode sacar on-chain para qualquer endereço.",
-                    parse_mode="Markdown",
-                    reply_markup=kb
-                )
+            
 
             except Exception as ee:
                 # falhou até o fallback → estorna
