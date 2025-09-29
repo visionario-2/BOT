@@ -17,6 +17,13 @@ from aiogram.fsm.context import FSMContext
 from fastapi import FastAPI, Request
 import uvicorn
 
+
+# ===== MATERIAIS / CONVERSÕES =====
+MATERIAIS_DIVISOR = 1000.0        # cada 1000 materiais viram 1 "unidade base"
+MATERIAIS_PCT_PAG = 0.40          # 40% vai para Cash de Pagamentos
+MATERIAIS_PCT_CASH = 0.60         # 60% vai para Cash Disponível
+
+
 # ===== Preço do TON em BRL – robusto, com cache, retries e múltiplas fontes =====
 
 PRICE_CACHE_SECONDS = int(os.getenv("PRICE_CACHE_SECONDS", "60"))  # TTL do cache (s)
@@ -214,17 +221,31 @@ def init_db():
     con.commit()
 
 def cadastrar_animais():
+    # (preco em cash, rendimento em MATERIAIS/dia)
     animais = [
-        ('Galinha', 100, 2, '🐔'), ('Porco', 500, 10, '🐖'),
-        ('Vaca', 1500, 30, '🐄'), ('Boi', 2500, 50, '🐂'),
-        ('Ovelha', 5000, 100, '🐑'), ('Coelho', 10000, 200, '🐇'),
-        ('Cabra', 15000, 300, '🐐'), ('Cavalo', 20000, 400, '🐎')
+        ('Galinha', 100,    800,    '🐔'),
+        ('Porco',   500,   4000,    '🐖'),
+        ('Vaca',   1500,  15000,    '🐄'),
+        ('Boi',    2500,  25000,    '🐂'),
+        ('Ovelha', 5000,  60000,    '🐑'),
+        ('Coelho',10000, 120000,    '🐇'),
+        ('Cabra', 20000, 280000,    '🐐'),
+        ('Cavalo',50000, 900000,    '🐎'),
     ]
     for nome, preco, rendimento, emoji in animais:
         cur.execute(
-            "INSERT OR IGNORE INTO animais (nome, preco, rendimento, emoji) VALUES (?, ?, ?, ?)",
-            (nome, preco, rendimento, emoji))
+            """
+            INSERT INTO animais (nome, preco, rendimento, emoji)
+            VALUES (?,?,?,?)
+            ON CONFLICT(nome) DO UPDATE SET
+                preco=excluded.preco,
+                rendimento=excluded.rendimento,
+                emoji=excluded.emoji
+            """,
+            (nome, preco, rendimento, emoji)
+        )
     con.commit()
+
 
 def ensure_schema():
     conn = sqlite3.connect(DB_PATH)
@@ -237,6 +258,8 @@ def ensure_schema():
             conn.execute("ALTER TABLE usuarios ADD COLUMN saldo_cash_pagamentos REAL DEFAULT 0.0")
         if not _column_exists(conn, "usuarios", "saldo_ton"):
             conn.execute("ALTER TABLE usuarios ADD COLUMN saldo_ton REAL DEFAULT 0.0")
+        if not _column_exists(conn, "usuarios", "saldo_materiais"):
+            conn.execute("ALTER TABLE usuarios ADD COLUMN saldo_materiais REAL DEFAULT 0.0")
 
         # Garantir que ultima_coleta não fique nula/vazia
         conn.execute(
@@ -263,6 +286,7 @@ def ensure_schema():
         conn.commit()
     finally:
         conn.close()
+
 
 
 # cria tudo primeiro, depois prossegue
@@ -465,6 +489,16 @@ def get_balances(user_id: int):
         if not r: return 0.0, 0.0, 0.0
         return r["saldo_cash"], r["saldo_cash_pagamentos"], r["saldo_ton"]
 
+
+# === NOVO: ler saldo de Materiais do usuário ===
+def get_user_materiais(user_id: int) -> float:
+    with db_conn() as c:
+        r = c.execute(
+            "SELECT COALESCE(saldo_materiais,0) AS m FROM usuarios WHERE telegram_id=?",
+            (user_id,)
+        ).fetchone()
+        return float(r["m"]) if r else 0.0
+
 def debit_cash_payments_and_credit_ton(user_id: int, amount_ton: float, ton_brl_price: float, cash_por_real: int):
     cash_needed = amount_ton * ton_brl_price * cash_por_real
     with db_conn() as c:
@@ -655,11 +689,12 @@ def menu():
         keyboard=[
             [types.KeyboardButton(text="🐾 Meus Animais"), types.KeyboardButton(text="💰 Meu Saldo")],
             [types.KeyboardButton(text="🛒 Comprar"), types.KeyboardButton(text="➕ Depositar")],
-            [types.KeyboardButton(text="🔄 Trocar cash por TON"), types.KeyboardButton(text="🏦 Sacar")],
+            [types.KeyboardButton(text="🔄 Trocas"), types.KeyboardButton(text="🏦 Sacar")],
             [types.KeyboardButton(text="👫 Indique & Ganhe"), types.KeyboardButton(text="❓ Ajuda/Suporte")]
         ],
         resize_keyboard=True
     )
+
 
 # ========= HANDLERS =========
 @dp.message(Command('start'))
@@ -698,35 +733,43 @@ async def start(msg: types.Message):
 
     texto = (
         "🌾 *Bem-vindo à Fazenda TON!*\n\n"
-        f"💸 Cash: `{saldo_cash:.0f}`\n"
+        f"💸 Cash Disponível: `{saldo_cash:.0f}`\n"
         f"💎 TON: `{saldo_ton:.4f}`\n"
         f"🐾 Animais: `{total_animais}`\n"
-        f"📈 Rendimento/dia: `{rendimento_dia:.2f}` cash\n\n"
+        f"📈 Rendimento/dia: `{rendimento_dia:.0f}` materiais\n\n"
         "Escolha uma opção:"
     )
+
     await msg.answer(texto, reply_markup=menu(), parse_mode="Markdown")
 
 @dp.message(F.text == "💰 Meu Saldo")
 async def saldo(msg: types.Message):
     user_id = msg.from_user.id
-    cur.execute("""
+    r = cur.execute("""
         SELECT 
-            COALESCE(saldo_cash,0)               AS cash_depositos,
+            COALESCE(saldo_cash,0)               AS cash_disp,
             COALESCE(saldo_cash_pagamentos,0)    AS cash_pag,
-            COALESCE(saldo_ton,0)                AS saldo_ton
+            COALESCE(saldo_ton,0)                AS saldo_ton,
+            COALESCE(saldo_materiais,0)          AS mats
         FROM usuarios WHERE telegram_id=?
-    """, (user_id,))
-    r = cur.fetchone() or (0,0,0)
-    cash_dep, cash_pag, saldo_ton = r
+    """, (user_id,)).fetchone() or (0,0,0,0)
+
+    cash_disp   = r["cash_disp"] if isinstance(r, sqlite3.Row) else r[0]
+    cash_pag    = r["cash_pag"]  if isinstance(r, sqlite3.Row) else r[1]
+    saldo_ton   = r["saldo_ton"] if isinstance(r, sqlite3.Row) else r[2]
+    materiais   = r["mats"]      if isinstance(r, sqlite3.Row) else r[3]
 
     await msg.answer(
         "📊 *Seus saldos*\n\n"
-        f"• 💸 Cash (depósitos / compra de animais): `{cash_dep:.0f}`\n"
-        f"• 🧾 Cash pagamentos (rendimentos): `{cash_pag:.0f}`\n"
-        f"• 💎 TON (conversões do cash pagamentos): `{saldo_ton:.6f}`\n\n"
-        f"_Obs.: Apenas o saldo TON pode ser sacado. O botão **🔄 Trocar cash por TON** usa **cash pagamentos**._",
+        f"• 💸 Cash Disponível: `{cash_disp:.0f}`\n"
+        f"• 🧾 Cash de Pagamentos: `{cash_pag:.0f}`\n"
+        f"• 🧱 Materiais: `{materiais:.0f}`\n"
+        f"• 💎 TON: `{saldo_ton:.6f}`\n\n"
+        "_Obs.: Apenas **Cash de Pagamentos** pode ser trocado por TON. "
+        "Use **🔄 Trocas** para converter Materiais → Cash e depois Cash → TON._",
         parse_mode="Markdown"
     )
+
 
 @dp.message(F.text == "🛒 Comprar")
 async def comprar(msg: types.Message):
@@ -735,9 +778,9 @@ async def comprar(msg: types.Message):
     for nome, preco, rendimento, emoji in cur.fetchall():
         card = (
             f"{emoji} *{nome}*\n"
-            f"💵 Preço: `{preco}` cash\n"
-            f"📈 Rende: `{rendimento}` cash/dia"
-        )
+            f"📈 Rende: `{int(rendimento):,}` Materiais/dia\n"
+            f"💵 Preço: `{preco}` cash"
+        ).replace(",", ".")  # troca separador milhar para ponto
         kb_inline = types.InlineKeyboardMarkup(inline_keyboard=[[
             types.InlineKeyboardButton(text=f"Comprar {emoji}", callback_data=f"buy:{nome}")
         ]])
@@ -804,9 +847,9 @@ async def meus_animais(msg: types.Message):
     for it in itens:
         linhas.append(
             f"{it['emoji']} {it['animal']}: `{it['qtd']}`  | "
-            f"Produzido: `{it['produzido']:.1f} cash`"
+            f"Produzido: `{it['produzido']:.0f}` materiais"
         )
-    linhas.append(f"\n📈 *Total produzido até agora:* `{total:.1f}` cash")
+    linhas.append(f"\n📈 *Total produzido até agora:* `{total:.0f}` materiais")
 
     kb = types.InlineKeyboardMarkup(inline_keyboard=[[
         types.InlineKeyboardButton(text="📥 Coletar rendimento", callback_data="collect:all")
@@ -827,26 +870,27 @@ async def coletar_rendimento_cb(call: types.CallbackQuery):
 
     agora = _iso_now()
     with db_conn() as c:
-        # credita no saldo de pagamentos
+        # credita nos Materiais
         c.execute("""
             UPDATE usuarios
-               SET saldo_cash_pagamentos = COALESCE(saldo_cash_pagamentos, 0) + ?
+               SET saldo_materiais = COALESCE(saldo_materiais, 0) + ?
              WHERE telegram_id = ?
         """, (total, user_id))
         # “zera” produção reiniciando o relógio
         c.execute("UPDATE inventario SET ultima_coleta = ? WHERE telegram_id = ?", (agora, user_id))
-        r = c.execute("SELECT COALESCE(saldo_cash_pagamentos,0) AS s FROM usuarios WHERE telegram_id=?",
+        r = c.execute("SELECT COALESCE(saldo_materiais,0) AS s FROM usuarios WHERE telegram_id=?",
                       (user_id,)).fetchone()
         novo_saldo = r["s"] if r else 0.0
 
     await call.message.answer(
         "📥 *Coleta concluída!*\n\n"
-        f"• Você coletou: `+{total:.1f}` cash\n"
-        f"• Saldo de pagamentos agora: `{novo_saldo:.1f}` cash\n\n"
-        "_Use **🔄 Trocar cash por TON** para converter._",
+        f"• Você coletou: `+{total:.0f}` materiais\n"
+        f"• Materiais agora: `{novo_saldo:.0f}`\n\n"
+        "_Use **🔄 Trocas** para converter Materiais → Cash._",
         parse_mode="Markdown"
     )
     await call.answer()
+
 
 
 # ===== Depósito via Crypto Pay (BRL) =====
@@ -910,6 +954,90 @@ async def gerar_link_custom(msg: types.Message):
     )
 
 # ===== Troca cash -> TON =====
+
+@dp.message(F.text == "🔄 Trocas")
+async def trocas_menu(msg: types.Message):
+    kb = types.InlineKeyboardMarkup(inline_keyboard=[
+        [types.InlineKeyboardButton(text="🔄 Trocar Materiais", callback_data="materials:convert_all")],
+        [types.InlineKeyboardButton(text="🔄 Trocar cash por TON", callback_data="ton:swap_menu")],
+    ])
+    await msg.answer("Escolha uma opção de troca:", reply_markup=kb)
+
+@dp.callback_query(F.data == "materials:convert_all")
+async def converter_materiais_cb(call: types.CallbackQuery):
+    user_id = call.from_user.id
+    mats = get_user_materiais(user_id)
+
+    if mats < 1000:
+        return await call.answer("Você precisa de pelo menos 1000 Materiais para converter.", show_alert=True)
+
+    # quantas unidades cheias de 1000 dá para converter
+    unidades = int(mats // MATERIAIS_DIVISOR)          # ex.: 230000 // 1000 => 230
+    usado = unidades * MATERIAIS_DIVISOR               # ex.: 230 * 1000 => 230000
+    sobra = mats - usado                                # mantém o resto < 1000
+
+    base = float(unidades)                              # 230
+    to_pag  = base * MATERIAIS_PCT_PAG                  # 92.0
+    to_cash = base * MATERIAIS_PCT_CASH                 # 138.0
+
+    with db_conn() as c:
+        c.execute("""
+            UPDATE usuarios
+               SET saldo_materiais = ?,
+                   saldo_cash_pagamentos = COALESCE(saldo_cash_pagamentos,0) + ?,
+                   saldo_cash = COALESCE(saldo_cash,0) + ?
+             WHERE telegram_id = ?
+        """, (sobra, to_pag, to_cash, user_id))
+
+    await call.message.answer(
+        "🔄 *Conversão de Materiais concluída!*\n\n"
+        f"• Materiais usados: `{int(usado):,}`\n"
+        f"• Base (÷{int(MATERIAIS_DIVISOR)}): `{int(base):,}`\n"
+        f"   ├─ ➕ Cash de Pagamentos (40%): `+{int(to_pag):,}`\n"
+        f"   └─ ➕ Cash Disponível (60%): `+{int(to_cash):,}`\n"
+        f"• Materiais restantes: `{int(sobra):,}`",
+        parse_mode="Markdown"
+    )
+    await call.answer()
+
+
+
+@dp.callback_query(F.data == "ton:swap_menu")
+async def abrir_swap_ton_cb(call: types.CallbackQuery):
+    user_id = call.from_user.id
+    row = cur.execute(
+        "SELECT COALESCE(saldo_cash_pagamentos,0) FROM usuarios WHERE telegram_id=?",
+        (user_id,)
+    ).fetchone()
+    saldo_pag = row[0] if row else 0
+
+    preco_brl = get_ton_price_brl()
+    cash_por_ton = max(1, int(round(preco_brl * CASH_POR_REAL)))
+
+    texto = (
+        "💱 *Troca cash de pagamentos → TON*\n"
+        f"Preço atual: `1 TON ≈ R$ {preco_brl:.2f}`\n"
+        f"Equivalência: `1 TON ≈ {cash_por_ton} cash`\n\n"
+        f"Seu cash de pagamentos disponível: `{saldo_pag:.0f}`\n\n"
+        "Escolha um valor (mín. `20` cash) ou digite: `trocar 250`"
+    )
+
+    kb = types.InlineKeyboardMarkup(inline_keyboard=[
+        [
+            types.InlineKeyboardButton(text="20 cash", callback_data="swap:20"),
+            types.InlineKeyboardButton(text="50", callback_data="swap:50"),
+            types.InlineKeyboardButton(text="100", callback_data="swap:100"),
+        ],
+        [
+            types.InlineKeyboardButton(text="500", callback_data="swap:500"),
+            types.InlineKeyboardButton(text="Tudo", callback_data="swap:all"),
+        ]
+    ])
+    await call.message.answer(texto, parse_mode="Markdown", reply_markup=kb)
+    await call.answer()
+
+
+
 @dp.message(F.text == "🔄 Trocar cash por TON")
 async def trocar_cash(msg: types.Message):
     user_id = msg.from_user.id
@@ -1269,12 +1397,13 @@ async def indicacao(msg: types.Message):
 async def ajuda(msg: types.Message):
     await msg.answer(
         "Dúvidas? Fale com o suporte: @seu_suporte\n\n"
-        "• 🛒 Comprar animais com cash\n"
+        "• 🛒 Comprar animais com Cash Disponível\n"
         "• 💰 Depositar via Crypto Pay (USDT/TON cobrados em BRL)\n"
-        "• 🔄 Trocar cash por TON\n"
+        "• 🔄 Trocas (Materiais → Cash e Cash de Pagamentos → TON)\n"
         "• 🏦 Sacar TON para sua carteira\n\n"
         "Qualquer dúvida, fale conosco!"
     )
+
 
 # ===== COMANDOS DE ADMIN =====
 @dp.message(Command("addcash"))
