@@ -1065,31 +1065,60 @@ async def processar_saque(msg: types.Message, state: FSMContext):
     except CryptoPayError as e:
         err = str(e)
         # 4) se não houver payouts habilitados → fallback: criar Check
-        if "METHOD_NOT_FOUND" in err or "createPayout" in err:
-            try:
-                chk = criar_check_ton(amount_ton)
-                set_withdraw_status(wid, "done")
-                check_url = chk.get("check_url") or chk.get("link") or ""
-                await msg.answer(
-                    "✅ *Saque criado como Check do CryptoBot*.\n\n"
-                    "Clique no link abaixo para resgatar o TON na sua carteira do CryptoBot e, de lá, sacar para qualquer endereço on-chain:\n"
-                    f"{check_url}",
-                    parse_mode="Markdown"
+        if "METHOD_NOT_FOUND" in err or "createPayout" in err or "METHOD_DISABLED" in err:
+    try:
+        chk = criar_check_ton(amount_ton)
+        set_withdraw_status(wid, "done")
+
+        # 1) tente o campo oficial que já vem pronto para o usuário
+        link = (
+            chk.get("bot_check_url")
+            or chk.get("check_url")
+            or chk.get("link")
+            or (f"https://t.me/CryptoBot?start=check_{chk.get('hash')}" if chk.get("hash") else "")
+        )
+
+        # 2) se mesmo assim não tiver link, avise claramente o admin
+        if not link:
+            # estorna o saldo do usuário, pois não conseguimos entregar o link
+            with db_conn() as c:
+                c.execute(
+                    "UPDATE usuarios SET saldo_ton = saldo_ton + ? WHERE telegram_id=?",
+                    (amount_ton, user_id)
                 )
-            except Exception as ee:
-                # falhou até o fallback → estorna
-                with db_conn() as c:
-                    c.execute(
-                        "UPDATE usuarios SET saldo_ton = saldo_ton + ? WHERE telegram_id=?",
-                        (amount_ton, user_id)
-                    )
-                set_withdraw_status(wid, "failed")
-                await msg.answer(
-                    "❌ Não foi possível completar o saque agora (fallback para Check falhou).\n"
-                    f"Detalhe: `{str(ee)[:200]}`\n"
-                    "O valor foi estornado para seu saldo TON. Tente novamente mais tarde.",
-                    parse_mode="Markdown"
-                )
+            set_withdraw_status(wid, "failed")
+            return await msg.answer(
+                "❌ Check criado, mas não recebi o link de resgate da API.\n"
+                "Avise o suporte/admin para verificar o método createCheck e os campos retornados.",
+            )
+
+        # 3) envie um botão com o link (evita problemas de parse_mode)
+        kb = types.InlineKeyboardMarkup(
+            inline_keyboard=[[types.InlineKeyboardButton(text="🔗 Resgatar no @CryptoBot", url=link)]]
+        )
+        await msg.answer(
+            "✅ Saque criado como *Check do CryptoBot*.\n\n"
+            "Toque no botão abaixo para resgatar o TON na sua carteira do @CryptoBot.\n"
+            "Depois você pode sacar on-chain para qualquer endereço.",
+            parse_mode="Markdown",
+            reply_markup=kb
+        )
+
+    except Exception as ee:
+        # falhou até o fallback → estorna
+        with db_conn() as c:
+            c.execute(
+                "UPDATE usuarios SET saldo_ton = saldo_ton + ? WHERE telegram_id=?",
+                (amount_ton, user_id)
+            )
+        set_withdraw_status(wid, "failed")
+        await msg.answer(
+            "❌ Não foi possível completar o saque agora (fallback para Check falhou).\n"
+            f"Detalhe: `{str(ee)[:200]}`\n"
+            "O valor foi estornado para seu saldo TON. Tente novamente mais tarde.",
+            parse_mode="Markdown"
+        )
+
         else:
             # outro erro qualquer → estorna
             with db_conn() as c:
