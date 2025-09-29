@@ -706,6 +706,7 @@ async def start(msg: types.Message):
     )
     con.commit()
 
+    # referência /start com indicação (sem mudanças)
     parts = (msg.text or "").split()
     ref_id = None
     if len(parts) >= 2 and parts[0] == '/start' and parts[1].isdigit():
@@ -717,13 +718,16 @@ async def start(msg: types.Message):
         )
         con.commit()
 
-    cur.execute("SELECT saldo_cash, saldo_ton FROM usuarios WHERE telegram_id=?", (user_id,))
-    row = cur.fetchone()
-    saldo_cash, saldo_ton = row if row else (0, 0)
+    # saldos que queremos mostrar
+    r = cur.execute("""
+        SELECT COALESCE(saldo_cash,0),
+               COALESCE(saldo_cash_pagamentos,0),
+               COALESCE(saldo_ton,0)
+        FROM usuarios WHERE telegram_id=?
+    """, (user_id,)).fetchone()
+    saldo_cash, saldo_pag, saldo_ton = r if r else (0, 0, 0)
 
-    cur.execute("SELECT SUM(quantidade) FROM inventario WHERE telegram_id=?", (user_id,))
-    total_animais = cur.fetchone()[0] or 0
-
+    # rendimento/dia em materiais
     cur.execute("""
         SELECT SUM(quantidade * rendimento)
         FROM inventario JOIN animais ON inventario.animal = animais.nome
@@ -733,14 +737,14 @@ async def start(msg: types.Message):
 
     texto = (
         "🌾 *Bem-vindo à Fazenda TON!*\n\n"
-        f"💸 Cash Disponível: `{saldo_cash:.0f}`\n"
-        f"💎 TON: `{saldo_ton:.4f}`\n"
-        f"🐾 Animais: `{total_animais}`\n"
-        f"📈 Rendimento/dia: `{rendimento_dia:.0f}` materiais\n\n"
+        f"💸 Cash Disponível: {saldo_cash:.0f}\n"
+        f"🧾 Cash de Pagamentos: {saldo_pag:.0f}\n"
+        f"💎 TON: {saldo_ton:.4f}\n\n"
+        f"📈 Rendimento/dia: {int(rendimento_dia)} materiais\n\n"
         "Escolha uma opção:"
     )
-
     await msg.answer(texto, reply_markup=menu(), parse_mode="Markdown")
+
 
 @dp.message(F.text == "💰 Meu Saldo")
 async def saldo(msg: types.Message):
@@ -759,16 +763,17 @@ async def saldo(msg: types.Message):
     saldo_ton   = r["saldo_ton"] if isinstance(r, sqlite3.Row) else r[2]
     materiais   = r["mats"]      if isinstance(r, sqlite3.Row) else r[3]
 
-    await msg.answer(
+    texto = (
         "📊 *Seus saldos*\n\n"
-        f"• 💸 Cash Disponível: `{cash_disp:.0f}`\n"
-        f"• 🧾 Cash de Pagamentos: `{cash_pag:.0f}`\n"
-        f"• 🧱 Materiais: `{materiais:.0f}`\n"
-        f"• 💎 TON: `{saldo_ton:.6f}`\n\n"
-        "_Obs.: Apenas **Cash de Pagamentos** pode ser trocado por TON. "
-        "Use **🔄 Trocas** para converter Materiais → Cash e depois Cash → TON._",
-        parse_mode="Markdown"
+        f"• 💸 Cash Disponível: {cash_disp:.0f}\n"
+        f"• 🧾 Cash de Pagamentos: {cash_pag:.0f}\n"
+        f"• 🧱 Materiais: {materiais:.0f}\n"
+        f"• 💎 TON: {saldo_ton:.6f}\n\n"
+        "Obs.: 🔄 Converta seus 🧱 Materiais em \"🔄 Trocas\" no menu!\n"
+        "Apenas 🧾 Cash de Pagamentos pode ser trocado por TON!"
     )
+    await msg.answer(texto, parse_mode="Markdown")
+
 
 
 @dp.message(F.text == "🛒 Comprar")
