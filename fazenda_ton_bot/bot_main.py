@@ -238,6 +238,9 @@ def ensure_schema():
         if not _column_exists(conn, "usuarios", "saldo_ton"):
             conn.execute("ALTER TABLE usuarios ADD COLUMN saldo_ton REAL DEFAULT 0.0")
 
+        
+        conn.execute("UPDATE inventario SET ultima_coleta = COALESCE(ultima_coleta, ?) WHERE ultima_coleta IS NULL", (_iso_now(),))
+
         conn.execute("""
         CREATE TABLE IF NOT EXISTS withdrawals (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -377,6 +380,61 @@ def _balance_code(b: dict) -> str:
          or "")
         .upper()
     )
+
+
+# ===== PRODUTIVIDADE (crescimento com o tempo) =====
+def _now():
+    return datetime.now()
+
+def _iso_now():
+    return _now().isoformat()
+
+def _produzido_desde(rendimento_dia: float, quantidade: int, ultima_coleta_iso: str | None) -> float:
+    """
+    rendimento_dia: cash/dia de UM animal
+    quantidade: número de animais
+    ultima_coleta_iso: texto ISO salvo na tabela
+    retorna o quanto foi produzido (em cash) desde a ultima_coleta
+    """
+    try:
+        base = datetime.fromisoformat(ultima_coleta_iso) if ultima_coleta_iso else None
+    except Exception:
+        base = None
+    if not base:
+        return 0.0
+    segundos = (_now() - base).total_seconds()
+    if segundos <= 0:
+        return 0.0
+    por_seg = (rendimento_dia * quantidade) / 86400.0
+    return max(0.0, por_seg * segundos)
+
+def get_producao_usuario(uid: int):
+    """
+    Retorna (itens, total) onde itens é uma lista de dicts:
+    {animal, emoji, qtd, produzido}
+    """
+    with db_conn() as c:
+        rows = c.execute("""
+            SELECT i.animal, i.quantidade, i.ultima_coleta, a.rendimento, a.emoji
+            FROM inventario i
+            JOIN animais a ON a.nome = i.animal
+            WHERE i.telegram_id = ?
+            ORDER BY a.preco ASC
+        """, (uid,)).fetchall()
+
+    itens, total = [], 0.0
+    for r in rows:
+        prod = _produzido_desde(r["rendimento"], int(r["quantidade"]), r["ultima_coleta"])
+        itens.append({
+            "animal": r["animal"],
+            "emoji":  r["emoji"],
+            "qtd":    int(r["quantidade"]),
+            "produzido": prod,
+        })
+        total += prod
+    return itens, total
+
+
 
 def db_conn():
     conn = sqlite3.connect(DB_PATH)
@@ -720,20 +778,68 @@ async def voltar(msg: types.Message):
 @dp.message(F.text == "🐾 Meus Animais")
 async def meus_animais(msg: types.Message):
     user_id = msg.from_user.id
-    cur.execute("SELECT animal, quantidade FROM inventario WHERE telegram_id=?", (user_id,))
-    itens = cur.fetchall()
+
+    # garante que não existem nulos para este usuário
+    with db_conn() as c:
+        c.execute("""
+            UPDATE inventario
+               SET ultima_coleta = COALESCE(ultima_coleta, ?)
+             WHERE telegram_id = ? AND (ultima_coleta IS NULL OR TRIM(ultima_coleta) = '')
+        """, (_iso_now(), user_id))
+
+    itens, total = get_producao_usuario(user_id)
+
     if not itens:
-        await msg.answer("Você ainda não possui animais. Compre um na loja!")
-        return
-    resposta = "🐾 *Seus Animais:*\n\n"
-    total_rendimento = 0
-    for animal, qtd in itens:
-        cur.execute("SELECT rendimento, emoji FROM animais WHERE nome=?", (animal,))
-        rendimento, emoji = cur.fetchone()
-        resposta += f"{emoji} {animal}: `{qtd}` | Rendimento: `{rendimento * qtd:.1f} cash/dia`\n"
-        total_rendimento += rendimento * qtd
-    resposta += f"\n📈 *Total rendimento/dia:* `{total_rendimento:.1f} cash`"
-    await msg.answer(resposta, parse_mode="Markdown")
+        return await msg.answer("Você ainda não possui animais. Compre um na loja!")
+
+    linhas = ["🐾 *Seus Animais:*\n"]
+    for it in itens:
+        linhas.append(
+            f"{it['emoji']} {it['animal']}: `{it['qtd']}`  | "
+            f"Produzido: `{it['produzido']:.1f} cash`"
+        )
+    linhas.append(f"\n📈 *Total produzido até agora:* `{total:.1f}` cash")
+
+    kb = types.InlineKeyboardMarkup(inline_keyboard=[[
+        types.InlineKeyboardButton(text="📥 Coletar rendimento", callback_data="collect:all")
+    ]])
+
+    await msg.answer("\n".join(linhas), parse_mode="Markdown", reply_markup=kb)
+
+
+@dp.callback_query(F.data == "collect:all")
+async def coletar_rendimento_cb(call: types.CallbackQuery):
+    user_id = call.from_user.id
+
+    itens, total = get_producao_usuario(user_id)
+    total = float(f"{total:.6f}")  # evita ruído de float
+
+    if total <= 0.01:
+        return await call.answer("Nada para coletar agora 🙂", show_alert=True)
+
+    agora = _iso_now()
+    with db_conn() as c:
+        # credita no saldo de pagamentos
+        c.execute("""
+            UPDATE usuarios
+               SET saldo_cash_pagamentos = COALESCE(saldo_cash_pagamentos, 0) + ?
+             WHERE telegram_id = ?
+        """, (total, user_id))
+        # “zera” produção reiniciando o relógio
+        c.execute("UPDATE inventario SET ultima_coleta = ? WHERE telegram_id = ?", (agora, user_id))
+        r = c.execute("SELECT COALESCE(saldo_cash_pagamentos,0) AS s FROM usuarios WHERE telegram_id=?",
+                      (user_id,)).fetchone()
+        novo_saldo = r["s"] if r else 0.0
+
+    await call.message.answer(
+        "📥 *Coleta concluída!*\n\n"
+        f"• Você coletou: `+{total:.1f}` cash\n"
+        f"• Saldo de pagamentos agora: `{novo_saldo:.1f}` cash\n\n"
+        "_Use **🔄 Trocar cash por TON** para converter._",
+        parse_mode="Markdown"
+    )
+    await call.answer()
+
 
 # ===== Depósito via Crypto Pay (BRL) =====
 @dp.message(StateFilter(None), F.text == "➕ Depositar")
