@@ -238,8 +238,15 @@ def ensure_schema():
         if not _column_exists(conn, "usuarios", "saldo_ton"):
             conn.execute("ALTER TABLE usuarios ADD COLUMN saldo_ton REAL DEFAULT 0.0")
 
-        
-        conn.execute("UPDATE inventario SET ultima_coleta = COALESCE(ultima_coleta, ?) WHERE ultima_coleta IS NULL", (_iso_now(),))
+        # Garantir que ultima_coleta não fique nula/vazia
+        conn.execute(
+            """
+            UPDATE inventario
+               SET ultima_coleta = COALESCE(ultima_coleta, ?)
+             WHERE ultima_coleta IS NULL OR TRIM(ultima_coleta) = ''
+            """,
+            (datetime.now().isoformat(),)
+        )
 
         conn.execute("""
         CREATE TABLE IF NOT EXISTS withdrawals (
@@ -256,6 +263,7 @@ def ensure_schema():
         conn.commit()
     finally:
         conn.close()
+
 
 # cria tudo primeiro, depois prossegue
 init_db()
