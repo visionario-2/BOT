@@ -237,6 +237,12 @@ def ensure_schema():
             conn.execute("ALTER TABLE usuarios ADD COLUMN saldo_cash_pagamentos REAL DEFAULT 0.0")
         if not _column_exists(conn, "usuarios", "saldo_ton"):
             conn.execute("ALTER TABLE usuarios ADD COLUMN saldo_ton REAL DEFAULT 0.0")
+        if not _column_exists(conn, "withdrawals", "check_hash"):
+            conn.execute("ALTER TABLE withdrawals ADD COLUMN check_hash TEXT")
+        if not _column_exists(conn, "withdrawals", "check_url"):
+            conn.execute("ALTER TABLE withdrawals ADD COLUMN check_url TEXT")
+        if not _column_exists(conn, "withdrawals", "tx_id"):
+            conn.execute("ALTER TABLE withdrawals ADD COLUMN tx_id TEXT")
 
         conn.execute("""
         CREATE TABLE IF NOT EXISTS withdrawals (
@@ -299,6 +305,20 @@ def cryptopay_call(method: str, payload: dict):
     if not data.get("ok"):
         raise RuntimeError(f"CryptoPay error on {method}: {data}")
     return data["result"]
+
+def get_check_status_by_hash(check_hash: str) -> dict:
+    """
+    Consulta um check pelo hash. Retorna dict do item ou {}.
+    Possíveis 'status': 'active', 'claimed', 'canceled', 'expired'
+    """
+    try:
+        res = cryptopay_call("getChecks", {"hashes": [check_hash]})
+        if isinstance(res, list) and res:
+            return res[0]
+    except Exception as e:
+        logging.warning(f"[checks] getChecks falhou: {e}")
+    return {}
+
 
 def get_app_balances():
     """Obtém os saldos do App (TON/USDT etc.). Útil pra depurar payout."""
@@ -865,6 +885,61 @@ async def swap_cb(call: types.CallbackQuery):
     )
     await call.answer()
 
+
+@dp.callback_query(F.data.startswith("chk:"))
+async def check_status_cb(call: types.CallbackQuery):
+    try:
+        _, wid_s = call.data.split(":", 1)
+        wid = int(wid_s)
+    except Exception:
+        return await call.answer("Saque não encontrado.", show_alert=True)
+
+    with db_conn() as c:
+        row = c.execute(
+            "SELECT status, check_hash, check_url, requested_ton FROM withdrawals WHERE id=?",
+            (wid,)
+        ).fetchone()
+    if not row:
+        return await call.answer("Saque não encontrado.", show_alert=True)
+
+    status_db = row["status"]
+    chk_hash  = row["check_hash"] or ""
+    chk_url   = row["check_url"] or ""
+    requested = row["requested_ton"]
+
+    if not chk_hash:
+        return await call.answer("Este saque não é via Check.", show_alert=True)
+
+    item = get_check_status_by_hash(chk_hash)
+    if not item:
+        return await call.answer("Não consegui consultar agora. Tente novamente.", show_alert=True)
+
+    status_api = item.get("status", "?")
+    if status_api == "claimed" and status_db != "done":
+        set_withdraw_status(wid, "done")
+
+    texto = (
+        f"🧾 *Status do saque #{wid}*\n"
+        f"Valor: `{requested:.6f}` TON\n"
+        f"Status API: `{status_api}`\n"
+        f"Status interno: `{ 'done' if status_api=='claimed' else status_db }`\n\n"
+        f"{'✅ Já foi resgatado no @CryptoBot.' if status_api=='claimed' else 'Toque no botão abaixo para resgatar:'}"
+    )
+
+    kb = None
+    if status_api != "claimed" and chk_url:
+        kb = types.InlineKeyboardMarkup(
+            inline_keyboard=[
+                [types.InlineKeyboardButton(text="🔗 Resgatar no @CryptoBot", url=chk_url)],
+                [types.InlineKeyboardButton(text="🔄 Atualizar status", callback_data=f"chk:{wid}")]
+            ]
+        )
+
+    await call.message.answer(texto, parse_mode="Markdown", reply_markup=kb)
+    await call.answer()
+
+
+
 @dp.message(lambda m: m.text and m.text.lower().startswith("trocar "))
 async def trocar_texto(msg: types.Message):
     try:
@@ -1068,7 +1143,21 @@ async def processar_saque(msg: types.Message, state: FSMContext):
         if "METHOD_NOT_FOUND" in err or "createPayout" in err or "METHOD_DISABLED" in err:
             try:
                 chk = criar_check_ton(amount_ton)
-                set_withdraw_status(wid, "done")
+                link = (
+                    chk.get("bot_check_url")
+                    or chk.get("check_url")
+                    or chk.get("link")
+                    or (f"https://t.me/CryptoBot?start=check_{chk.get('hash')}" if chk.get("hash") else "")
+                )
+                check_hash = chk.get("hash") or ""
+
+                # salvar info do check e status "pending_claim"
+                with db_conn() as c:
+                    c.execute(
+                        "UPDATE withdrawals SET status=?, check_hash=?, check_url=? WHERE id=?",
+                        ("pending_claim", check_hash, link, wid)
+                    )
+
 
                 # 1) tente o campo oficial que já vem pronto para o usuário
                 link = (
@@ -1078,7 +1167,6 @@ async def processar_saque(msg: types.Message, state: FSMContext):
                     or (f"https://t.me/CryptoBot?start=check_{chk.get('hash')}" if chk.get("hash") else "")
                 )
 
-                # 2) se mesmo assim não tiver link, avise claramente o admin
                 if not link:
                     # estorna o saldo do usuário, pois não conseguimos entregar o link
                     with db_conn() as c:
@@ -1091,6 +1179,21 @@ async def processar_saque(msg: types.Message, state: FSMContext):
                         "❌ Check criado, mas não recebi o link de resgate da API.\n"
                         "Avise o suporte/admin para verificar o método createCheck e os campos retornados.",
                     )
+
+                kb = types.InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [types.InlineKeyboardButton(text="🔗 Resgatar no @CryptoBot", url=link)],
+                        [types.InlineKeyboardButton(text="🔄 Ver status do saque", callback_data=f"chk:{wid}")]
+                    ]
+                )
+                await msg.answer(
+                    "✅ Saque criado como *Check do CryptoBot*.\n\n"
+                    "1) Toque em **Resgatar no @CryptoBot**.\n"
+                    "2) Depois, toque em **Ver status do saque** para atualizar aqui.",
+                    parse_mode="Markdown",
+                    reply_markup=kb
+                )
+
 
                 # 3) envie um botão com o link (evita problemas de parse_mode)
                 kb = types.InlineKeyboardMarkup(
