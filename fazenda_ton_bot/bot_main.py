@@ -22,6 +22,7 @@ import uvicorn
 MATERIAIS_DIVISOR = 1000.0        # cada 1000 materiais viram 1 "unidade base"
 MATERIAIS_PCT_PAG = 0.40          # 40% vai para Cash de Pagamentos
 MATERIAIS_PCT_CASH = 0.60         # 60% vai para Cash Disponível
+MATERIAIS_MIN_VENDA = 2000.0      # quantidade mínima para vender
 
 
 # ===== Preço do TON em BRL – robusto, com cache, retries e múltiplas fontes =====
@@ -962,20 +963,36 @@ async def gerar_link_custom(msg: types.Message):
 
 @dp.message(F.text == "🔄 Trocas")
 async def trocas_menu(msg: types.Message):
+    user_id = msg.from_user.id
+    total_mats = int(get_user_materiais(user_id))  # sem separador de milhar
+
+    texto = (
+        "Você pode vender sua produção de carne e receber 🧾 Cash de Pagamento,\n"
+        "que podem ser trocados por TON na segunda opção.\n"
+        "A venda é convertida em dois tipos de saldo (Cash disponível e Cash de pagamento) na seguinte proporção: \n\n"
+        "60% para o Saldo disponível 💸\n"
+        "40% para o Saldo de pagamento 🧾.\n"
+        f"Total de Materiais: {total_mats} 🧱\n\n"
+        f"Taxa de venda: {int(MATERIAIS_DIVISOR)} 🧱 = 1\n"
+        f"Quantidade mínima: {int(MATERIAIS_MIN_VENDA)} 🧱"
+    )
+
     kb = types.InlineKeyboardMarkup(inline_keyboard=[
-        [types.InlineKeyboardButton(text="🔄 Trocar Materiais", callback_data="materials:convert_all")],
+        [types.InlineKeyboardButton(text="🔄 Vender Materiais", callback_data="materials:convert_all")],
         [types.InlineKeyboardButton(text="🔄 Trocar cash por TON", callback_data="ton:swap_menu")],
     ])
-    await msg.answer("Escolha uma opção de troca:", reply_markup=kb)
+    await msg.answer(texto, reply_markup=kb)
+
 
 @dp.callback_query(F.data == "materials:convert_all")
 async def converter_materiais_cb(call: types.CallbackQuery):
     user_id = call.from_user.id
     mats = get_user_materiais(user_id)
 
-    # exige pelo menos 1000 materiais
-    if mats < MATERIAIS_DIVISOR:
-        return await call.answer("Você precisa de pelo menos 1000 Materiais para converter.", show_alert=True)
+    # exige pelo menos 2000 materiais
+    if mats < MATERIAIS_MIN_VENDA:
+        return await call.answer("Você precisa de pelo menos 2000 Materiais para converter.", show_alert=True)
+
 
     # unidades inteiras de (1000) que podem ser convertidas
     unidades = int(mats // MATERIAIS_DIVISOR)        # p.ex.: 9299000 // 1000 => 9299
