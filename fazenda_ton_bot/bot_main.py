@@ -981,7 +981,7 @@ async def trocas_menu(msg: types.Message):
         [types.InlineKeyboardButton(text="🔄 Vender Materiais", callback_data="materials:convert_all")],
         [types.InlineKeyboardButton(text="🔄 Trocar cash por TON", callback_data="ton:swap_menu")],
     ])
-    await msg.answer(texto, reply_markup=kb)
+    await msg.answer(texto, reply_markup=kb, parse_mode="Markdown")
 
 
 @dp.callback_query(F.data == "materials:convert_all")
