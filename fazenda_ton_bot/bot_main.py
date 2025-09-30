@@ -967,14 +967,14 @@ async def trocas_menu(msg: types.Message):
     total_mats = int(get_user_materiais(user_id))  # sem separador de milhar
 
     texto = (
-        "Você pode vender sua produção de carne e receber 🧾 Cash de Pagamento,\n"
-        "que podem ser trocados por TON na segunda opção.\n"
+        "Você pode vender sua produção de carne e receber 🧾 *Cash de Pagamento*,\n"
+        "que podem ser trocados por *TON na segunda opção*.\n"
         "A venda é convertida em dois tipos de saldo (Cash disponível e Cash de pagamento) na seguinte proporção: \n\n"
-        "60% para o Saldo disponível 💸\n"
-        "40% para o Saldo de pagamento 🧾.\n"
-        f"Total de Materiais: {total_mats} 🧱\n\n"
-        f"Taxa de venda: {int(MATERIAIS_DIVISOR)} 🧱 = 1\n"
-        f"Quantidade mínima: {int(MATERIAIS_MIN_VENDA)} 🧱"
+        "*60%* para o Cash disponível 💸\n"
+        "*40%* para o Cash de pagamento 🧾.\n"
+        f"Total de Materiais: *{total_mats}* 🧱\n\n"
+        f"Taxa de venda: *{int(MATERIAIS_DIVISOR)}* 🧱 = *1*\n"
+        f"Quantidade mínima: *{int(MATERIAIS_MIN_VENDA)}* 🧱"
     )
 
     kb = types.InlineKeyboardMarkup(inline_keyboard=[
