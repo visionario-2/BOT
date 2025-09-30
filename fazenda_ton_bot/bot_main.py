@@ -967,7 +967,7 @@ async def trocas_menu(msg: types.Message):
     total_mats = int(get_user_materiais(user_id))  # sem separador de milhar
 
     texto = (
-        "Você pode vender sua produção de carne e receber 🧾 *Cash de Pagamento*,\n"
+        "Você pode vender sua produção de Materiais e receber 🧾 *Cash de Pagamento*,\n"
         "que podem ser trocados por *TON na segunda opção*.\n"
         "A venda é convertida em dois tipos de saldo (Cash disponível e Cash de pagamento) na seguinte proporção: \n\n"
         "*60%* para o Cash disponível 💸\n"
