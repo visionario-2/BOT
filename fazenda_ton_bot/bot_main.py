@@ -1083,7 +1083,7 @@ async def converter_materiais_cb(call: types.CallbackQuery):
 
     texto = (
         "✅ Venda de materiais bem sucedida!\n\n"
-        f"• Materiais usados: {usado}\n"
+        
         f"   ├─ ✅ Cash de Pagamentos: +{to_pag}\n"
         f"   └─ ✅ Cash Disponível: +{to_cash}\n"
         f"• Materiais restantes: {int(sobra)}"
