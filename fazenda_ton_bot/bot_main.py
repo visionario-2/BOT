@@ -908,8 +908,8 @@ async def meus_animais(msg: types.Message):
         )
     linhas.append(f"\n📈 *Total Produzido:* *{total:.0f}* 🧱")
 
-    # botão com token (ex.: expira em 10 minutos = 30s)
-     tok = cb_new(user_id, action="collect", payload="all", ttl=30)
+    # botão com token (ex.: expira em 30 segundos = 30s)
+    tok = cb_new(user_id, action="collect", payload="all", ttl=30)
     kb = types.InlineKeyboardMarkup(inline_keyboard=[[
         types.InlineKeyboardButton(text="📥 Coletar rendimento", callback_data=f"collect:{tok}")
     ]])
@@ -932,16 +932,19 @@ async def coletar_rendimento_cb(call: types.CallbackQuery):
     if not ok:
         return await call.answer(err, show_alert=True)
 
+    # 👉 calcular produção atual
+    itens, total = get_producao_usuario(user_id)
+    total = float(f"{total:.6f}")
+    if total <= 0.01:
+        return await call.answer("Nada para coletar agora 🙂", show_alert=True)
 
     agora = _iso_now()
     with db_conn() as c:
-        # credita nos Materiais
         c.execute("""
             UPDATE usuarios
                SET saldo_materiais = COALESCE(saldo_materiais, 0) + ?
              WHERE telegram_id = ?
         """, (total, user_id))
-        # “zera” produção reiniciando o relógio
         c.execute("UPDATE inventario SET ultima_coleta = ? WHERE telegram_id = ?", (agora, user_id))
         r = c.execute("SELECT COALESCE(saldo_materiais,0) AS s FROM usuarios WHERE telegram_id=?",
                       (user_id,)).fetchone()
@@ -954,7 +957,6 @@ async def coletar_rendimento_cb(call: types.CallbackQuery):
         "_Use **🔄 Trocas** para converter Materiais → Cash._",
         parse_mode="Markdown"
     )
-
     await call.answer()
 
 
@@ -1037,7 +1039,7 @@ async def trocas_menu(msg: types.Message):
         f"Quantidade mínima: *{int(MATERIAIS_MIN_VENDA)}* 🧱"
     )
 
-     tok = cb_new(user_id, action="materials", payload="convert_all", ttl=30)
+    tok = cb_new(user_id, action="materials", payload="convert_all", ttl=30)
     kb = types.InlineKeyboardMarkup(inline_keyboard=[
         [types.InlineKeyboardButton(text="🔄 Vender Materiais", callback_data=f"materials:{tok}")],
         [types.InlineKeyboardButton(text="🔄 Trocar cash por TON", callback_data="ton:swap_menu")],
@@ -1058,17 +1060,18 @@ async def converter_materiais_cb(call: types.CallbackQuery):
     if not ok:
         return await call.answer(err, show_alert=True)
 
+    # 👉 obter materiais atuais
+    mats = get_user_materiais(user_id)
+    if mats < MATERIAIS_MIN_VENDA:
+        return await call.answer("Você precisa de pelo menos 2000 Materiais para converter.", show_alert=True)
 
-    # unidades inteiras de (1000) que podem ser convertidas
-    unidades = int(mats // MATERIAIS_DIVISOR)        # p.ex.: 9299000 // 1000 => 9299
-    usado = int(unidades * MATERIAIS_DIVISOR)        # p.ex.: 9299 * 1000 => 9299000
-    sobra = mats - usado                              # resto < 1000 (pode ser float)
+    # cálculo
+    unidades = int(mats // MATERIAIS_DIVISOR)
+    usado = int(unidades * MATERIAIS_DIVISOR)
+    sobra = mats - usado
+    to_pag  = int(unidades * MATERIAIS_PCT_PAG)
+    to_cash = int(unidades * MATERIAIS_PCT_CASH)
 
-    # divisão interna (sem exibir a conta)
-    to_pag  = int(unidades * MATERIAIS_PCT_PAG)      # ex.: 40%
-    to_cash = int(unidades * MATERIAIS_PCT_CASH)     # ex.: 60%
-
-    # atualiza saldos
     with db_conn() as c:
         c.execute("""
             UPDATE usuarios
@@ -1078,7 +1081,6 @@ async def converter_materiais_cb(call: types.CallbackQuery):
              WHERE telegram_id = ?
         """, (sobra, to_pag, to_cash, user_id))
 
-    # mensagem enxuta, sem vírgulas/pontos como separador de milhar
     texto = (
         "✅ Venda de materiais bem sucedida!\n\n"
         f"• Materiais usados: {usado}\n"
@@ -1086,9 +1088,9 @@ async def converter_materiais_cb(call: types.CallbackQuery):
         f"   └─ ✅ Cash Disponível: +{to_cash}\n"
         f"• Materiais restantes: {int(sobra)}"
     )
-
     await call.message.answer(texto)
     await call.answer()
+
 
 
 
@@ -1140,34 +1142,41 @@ async def abrir_swap_ton_cb(call: types.CallbackQuery):
 async def trocar_cash(msg: types.Message):
     user_id = msg.from_user.id
     row = cur.execute(
-        "SELECT COALESCE(saldo_cash_pagamentos,0), COALESCE(saldo_ton,0) FROM usuarios WHERE telegram_id=?",
+        "SELECT COALESCE(saldo_cash_pagamentos,0) FROM usuarios WHERE telegram_id=?",
         (user_id,)
     ).fetchone()
-    saldo_pag, saldo_ton = row if row else (0, 0)
+    saldo_pag = row[0] if row else 0
 
     preco_brl = get_ton_price_brl()
     cash_por_ton = max(1, int(round(preco_brl * CASH_POR_REAL)))
 
     texto = (
         "💱 *Troca cash pagamentos → TON*\n"
-        f"Preço atual (CoinGecko): `1 TON ≈ R$ {preco_brl:.2f}`\n"
+        f"Preço atual: `1 TON ≈ R$ {preco_brl:.2f}`\n"
         f"Equivalência: `1 TON ≈ {cash_por_ton} cash`\n\n"
         f"Seu cash pagamentos disponível: `{saldo_pag:.0f}`\n\n"
         "Escolha um valor (mín. `20` cash) ou digite: `trocar 250`"
     )
 
+    tok20  = cb_new(user_id, action="swap", payload="20",  ttl=30)
+    tok50  = cb_new(user_id, action="swap", payload="50",  ttl=30)
+    tok100 = cb_new(user_id, action="swap", payload="100", ttl=30)
+    tok500 = cb_new(user_id, action="swap", payload="500", ttl=30)
+    tokall = cb_new(user_id, action="swap", payload="all", ttl=30)
+
     kb = types.InlineKeyboardMarkup(inline_keyboard=[
         [
-            types.InlineKeyboardButton(text="20 cash", callback_data="swap:20"),
-            types.InlineKeyboardButton(text="50", callback_data="swap:50"),
-            types.InlineKeyboardButton(text="100", callback_data="swap:100"),
+            types.InlineKeyboardButton(text="20 cash", callback_data=f"swap:20:{tok20}"),
+            types.InlineKeyboardButton(text="50",      callback_data=f"swap:50:{tok50}"),
+            types.InlineKeyboardButton(text="100",     callback_data=f"swap:100:{tok100}"),
         ],
         [
-            types.InlineKeyboardButton(text="500", callback_data="swap:500"),
-            types.InlineKeyboardButton(text="Tudo", callback_data="swap:all"),
+            types.InlineKeyboardButton(text="500",     callback_data=f"swap:500:{tok500}"),
+            types.InlineKeyboardButton(text="Tudo",    callback_data=f"swap:all:{tokall}"),
         ]
     ])
     await msg.answer(texto, parse_mode="Markdown", reply_markup=kb)
+
 
 @dp.callback_query(F.data.startswith("swap:"))
 async def swap_cb(call: types.CallbackQuery):
