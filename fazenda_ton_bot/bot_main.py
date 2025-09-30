@@ -706,7 +706,6 @@ async def start(msg: types.Message):
     )
     con.commit()
 
-    # referência /start com indicação (sem mudanças)
     parts = (msg.text or "").split()
     ref_id = None
     if len(parts) >= 2 and parts[0] == '/start' and parts[1].isdigit():
@@ -718,16 +717,12 @@ async def start(msg: types.Message):
         )
         con.commit()
 
-    # saldos que queremos mostrar
-    r = cur.execute("""
-        SELECT COALESCE(saldo_cash,0),
-               COALESCE(saldo_cash_pagamentos,0),
-               COALESCE(saldo_ton,0)
-        FROM usuarios WHERE telegram_id=?
-    """, (user_id,)).fetchone()
-    saldo_cash, saldo_pag, saldo_ton = r if r else (0, 0, 0)
+    # agora buscamos também o cash de pagamentos
+    cur.execute("SELECT COALESCE(saldo_cash,0), COALESCE(saldo_cash_pagamentos,0), COALESCE(saldo_ton,0) FROM usuarios WHERE telegram_id=?", (user_id,))
+    row = cur.fetchone()
+    saldo_cash, saldo_pag, saldo_ton = row if row else (0, 0, 0)
 
-    # rendimento/dia em materiais
+    # rendimento/dia (em materiais)
     cur.execute("""
         SELECT SUM(quantidade * rendimento)
         FROM inventario JOIN animais ON inventario.animal = animais.nome
@@ -737,13 +732,14 @@ async def start(msg: types.Message):
 
     texto = (
         "🌾 *Bem-vindo à Fazenda TON!*\n\n"
-        f"💸 Cash Disponível: {saldo_cash:.0f}\n"
-        f"🧾 Cash de Pagamentos: {saldo_pag:.0f}\n"
-        f"💎 TON: {saldo_ton:.4f}\n\n"
-        f"📈 Rendimento/dia: {int(rendimento_dia)} materiais\n\n"
+        f"💸 Cash Disponível: *{saldo_cash:.0f}*\n"
+        f"🧾 Cash de Pagamentos: *{saldo_pag:.0f}*\n"
+        f"💎 TON: *{saldo_ton:.4f}*\n\n"
+        f"📈 Rendimento/dia: *{int(rendimento_dia):,}* materiais\n\n"
         "Escolha uma opção:"
-    )
+    ).replace(",", ".")  # milhar com ponto
     await msg.answer(texto, reply_markup=menu(), parse_mode="Markdown")
+
 
 
 @dp.message(F.text == "💰 Meu Saldo")
@@ -765,14 +761,15 @@ async def saldo(msg: types.Message):
 
     texto = (
         "📊 *Seus saldos*\n\n"
-        f"• 💸 Cash Disponível: {cash_disp:.0f}\n"
-        f"• 🧾 Cash de Pagamentos: {cash_pag:.0f}\n"
-        f"• 🧱 Materiais: {materiais:.0f}\n"
-        f"• 💎 TON: {saldo_ton:.6f}\n\n"
-        "Obs.: 🔄 Converta seus 🧱 Materiais em \"🔄 Trocas\" no menu!\n"
+        f"• 💸 Cash Disponível: *{cash_disp:.0f}*\n"
+        f"• 🧾 Cash de Pagamentos: *{cash_pag:.0f}*\n"
+        f"• 🧱 Materiais: *{materiais:.0f}*\n"
+        f"• 💎 TON: *{saldo_ton:.6f}*\n\n"
+        "Obs.: 🔄 Converta seus 🧱 Materiais em *🔄 Trocas* no menu!\n"
         "Apenas 🧾 Cash de Pagamentos pode ser trocado por TON!"
     )
     await msg.answer(texto, parse_mode="Markdown")
+
 
 
 
@@ -783,8 +780,8 @@ async def comprar(msg: types.Message):
     for nome, preco, rendimento, emoji in cur.fetchall():
         card = (
             f"{emoji} *{nome}*\n"
-            f"📈 Rende: `{int(rendimento):,}` Materiais/dia\n"
-            f"💵 Preço: `{preco}` cash"
+            f"📈 Rende: *{int(rendimento):,}* Materiais/dia\n"
+            f"💵 Preço: *{preco}* cash"
         ).replace(",", ".")  # troca separador milhar para ponto
         kb_inline = types.InlineKeyboardMarkup(inline_keyboard=[[
             types.InlineKeyboardButton(text=f"Comprar {emoji}", callback_data=f"buy:{nome}")
@@ -835,7 +832,6 @@ async def voltar(msg: types.Message):
 async def meus_animais(msg: types.Message):
     user_id = msg.from_user.id
 
-    # garante que não existem nulos para este usuário
     with db_conn() as c:
         c.execute("""
             UPDATE inventario
@@ -848,19 +844,22 @@ async def meus_animais(msg: types.Message):
     if not itens:
         return await msg.answer("Você ainda não possui animais. Compre um na loja!")
 
-    linhas = ["🐾 *Seus Animais:*\n"]
+    linhas = [
+        "Acompanhe a produção de *materiais* dos seus animais e colete para converter em *Saldo Cash de Pagamento* 🧾.\n"
+        "Não deixe de colher regularmente!\n"
+    ]
     for it in itens:
         linhas.append(
-            f"{it['emoji']} {it['animal']}: `{it['qtd']}`  | "
-            f"Produzido: `{it['produzido']:.0f}` materiais"
+            f"{it['emoji']} {it['animal']} (*{it['qtd']}*):  *{it['produzido']:.0f}* 🧱"
         )
-    linhas.append(f"\n📈 *Total produzido até agora:* `{total:.0f}` materiais")
+    linhas.append(f"\n📈 *Total Produzido:* *{total:.0f}* 🧱")
 
     kb = types.InlineKeyboardMarkup(inline_keyboard=[[
         types.InlineKeyboardButton(text="📥 Coletar rendimento", callback_data="collect:all")
     ]])
 
-    await msg.answer("\n".join(linhas), parse_mode="Markdown", reply_markup=kb)
+    await msg.answer("\n".join(linhas).replace(",", "."), parse_mode="Markdown", reply_markup=kb)
+
 
 
 @dp.callback_query(F.data == "collect:all")
@@ -889,11 +888,12 @@ async def coletar_rendimento_cb(call: types.CallbackQuery):
 
     await call.message.answer(
         "📥 *Coleta concluída!*\n\n"
-        f"• Você coletou: `+{total:.0f}` materiais\n"
-        f"• Materiais agora: `{novo_saldo:.0f}`\n\n"
+        f"• Você coletou: *+{total:.0f}* 🧱\n"
+        f"• Materiais agora: *{novo_saldo:.0f}* 🧱\n\n"
         "_Use **🔄 Trocas** para converter Materiais → Cash._",
         parse_mode="Markdown"
     )
+
     await call.answer()
 
 
