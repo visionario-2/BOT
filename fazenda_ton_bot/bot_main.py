@@ -973,18 +973,20 @@ async def converter_materiais_cb(call: types.CallbackQuery):
     user_id = call.from_user.id
     mats = get_user_materiais(user_id)
 
-    if mats < 1000:
+    # exige pelo menos 1000 materiais
+    if mats < MATERIAIS_DIVISOR:
         return await call.answer("Você precisa de pelo menos 1000 Materiais para converter.", show_alert=True)
 
-    # quantas unidades cheias de 1000 dá para converter
-    unidades = int(mats // MATERIAIS_DIVISOR)          # ex.: 230000 // 1000 => 230
-    usado = unidades * MATERIAIS_DIVISOR               # ex.: 230 * 1000 => 230000
-    sobra = mats - usado                                # mantém o resto < 1000
+    # unidades inteiras de (1000) que podem ser convertidas
+    unidades = int(mats // MATERIAIS_DIVISOR)        # p.ex.: 9299000 // 1000 => 9299
+    usado = int(unidades * MATERIAIS_DIVISOR)        # p.ex.: 9299 * 1000 => 9299000
+    sobra = mats - usado                              # resto < 1000 (pode ser float)
 
-    base = float(unidades)                              # 230
-    to_pag  = base * MATERIAIS_PCT_PAG                  # 92.0
-    to_cash = base * MATERIAIS_PCT_CASH                 # 138.0
+    # divisão interna (sem exibir a conta)
+    to_pag  = int(unidades * MATERIAIS_PCT_PAG)      # ex.: 40%
+    to_cash = int(unidades * MATERIAIS_PCT_CASH)     # ex.: 60%
 
+    # atualiza saldos
     with db_conn() as c:
         c.execute("""
             UPDATE usuarios
@@ -994,15 +996,16 @@ async def converter_materiais_cb(call: types.CallbackQuery):
              WHERE telegram_id = ?
         """, (sobra, to_pag, to_cash, user_id))
 
-    await call.message.answer(
-        "🔄 *Conversão de Materiais concluída!*\n\n"
-        f"• Materiais usados: `{int(usado):,}`\n"
-        f"• Base (÷{int(MATERIAIS_DIVISOR)}): `{int(base):,}`\n"
-        f"   ├─ ➕ Cash de Pagamentos (40%): `+{int(to_pag):,}`\n"
-        f"   └─ ➕ Cash Disponível (60%): `+{int(to_cash):,}`\n"
-        f"• Materiais restantes: `{int(sobra):,}`",
-        parse_mode="Markdown"
+    # mensagem enxuta, sem vírgulas/pontos como separador de milhar
+    texto = (
+        "✅ Venda de materiais bem sucedida!\n\n"
+        f"• Materiais usados: {usado}\n"
+        f"   ├─ ✅ Cash de Pagamentos: +{to_pag}\n"
+        f"   └─ ✅ Cash Disponível: +{to_cash}\n"
+        f"• Materiais restantes: {int(sobra)}"
     )
+
+    await call.message.answer(texto)
     await call.answer()
 
 
