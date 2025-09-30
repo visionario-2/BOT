@@ -284,6 +284,20 @@ def ensure_schema():
           updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
         """)
+        
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS cb_tokens (
+            id TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            action TEXT NOT NULL,
+            payload TEXT,
+            expires_at INTEGER NOT NULL,
+            used INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+        """)
+
+        
         conn.commit()
     finally:
         conn.close()
@@ -413,6 +427,45 @@ def _balance_code(b: dict) -> str:
          or "")
         .upper()
     )
+
+def cb_new(user_id: int, action: str, payload: str = "", ttl: int = 600) -> str:
+    """
+    Cria um token de callback com expiração (TTL em segundos).
+    Retorna o token (8-hex).
+    """
+    token = uuid.uuid4().hex[:8]
+    exp = int(time.time()) + ttl
+    with db_conn() as c:
+        c.execute(
+            "INSERT OR REPLACE INTO cb_tokens (id, user_id, action, payload, expires_at, used, created_at) "
+            "VALUES (?, ?, ?, ?, ?, 0, ?)",
+            (token, user_id, action, payload, exp, _iso_now())
+        )
+    return token
+
+def cb_check_and_use(token: str, user_id: int, action: str) -> tuple[bool, str | None, str]:
+    """
+    Valida e marca como 'usado' um token. 
+    Retorna (ok, payload, msg_erro).
+    """
+    now = int(time.time())
+    with db_conn() as c:
+        row = c.execute(
+            "SELECT user_id, action, payload, expires_at, used FROM cb_tokens WHERE id=?",
+            (token,)
+        ).fetchone()
+        if not row:
+            return False, None, "Essa interação expirou. Por favor, tente novamente."
+        if int(row["user_id"]) != int(user_id) or row["action"] != action:
+            return False, None, "Essa interação não é mais válida. Por favor, tente novamente."
+        if int(row["used"]) == 1:
+            return False, None, "Essa interação já foi usada. Por favor, tente novamente."
+        if int(row["expires_at"]) < now:
+            return False, None, "Essa interação expirou. Por favor, tente novamente."
+        c.execute("UPDATE cb_tokens SET used=1 WHERE id=?", (token,))
+        payload = row["payload"] if row["payload"] is not None else ""
+        return True, payload, ""
+
 
 
 # ===== PRODUTIVIDADE (crescimento com o tempo) =====
@@ -855,23 +908,30 @@ async def meus_animais(msg: types.Message):
         )
     linhas.append(f"\n📈 *Total Produzido:* *{total:.0f}* 🧱")
 
+    # botão com token (ex.: expira em 10 minutos = 30s)
+     tok = cb_new(user_id, action="collect", payload="all", ttl=30)
     kb = types.InlineKeyboardMarkup(inline_keyboard=[[
-        types.InlineKeyboardButton(text="📥 Coletar rendimento", callback_data="collect:all")
+        types.InlineKeyboardButton(text="📥 Coletar rendimento", callback_data=f"collect:{tok}")
     ]])
 
     await msg.answer("\n".join(linhas).replace(",", "."), parse_mode="Markdown", reply_markup=kb)
 
 
 
-@dp.callback_query(F.data == "collect:all")
+@dp.callback_query(F.data.startswith("collect:"))
 async def coletar_rendimento_cb(call: types.CallbackQuery):
     user_id = call.from_user.id
 
-    itens, total = get_producao_usuario(user_id)
-    total = float(f"{total:.6f}")  # evita ruído de float
+    # valida token
+    try:
+        _, token = call.data.split(":", 1)
+    except Exception:
+        return await call.answer("Essa interação expirou. Por favor, tente novamente.", show_alert=True)
 
-    if total <= 0.01:
-        return await call.answer("Nada para coletar agora 🙂", show_alert=True)
+    ok, payload, err = cb_check_and_use(token, user_id, action="collect")
+    if not ok:
+        return await call.answer(err, show_alert=True)
+
 
     agora = _iso_now()
     with db_conn() as c:
@@ -977,21 +1037,26 @@ async def trocas_menu(msg: types.Message):
         f"Quantidade mínima: *{int(MATERIAIS_MIN_VENDA)}* 🧱"
     )
 
+     tok = cb_new(user_id, action="materials", payload="convert_all", ttl=30)
     kb = types.InlineKeyboardMarkup(inline_keyboard=[
-        [types.InlineKeyboardButton(text="🔄 Vender Materiais", callback_data="materials:convert_all")],
+        [types.InlineKeyboardButton(text="🔄 Vender Materiais", callback_data=f"materials:{tok}")],
         [types.InlineKeyboardButton(text="🔄 Trocar cash por TON", callback_data="ton:swap_menu")],
     ])
     await msg.answer(texto, reply_markup=kb, parse_mode="Markdown")
 
-
-@dp.callback_query(F.data == "materials:convert_all")
+@dp.callback_query(F.data.startswith("materials:"))
 async def converter_materiais_cb(call: types.CallbackQuery):
     user_id = call.from_user.id
-    mats = get_user_materiais(user_id)
 
-    # exige pelo menos 2000 materiais
-    if mats < MATERIAIS_MIN_VENDA:
-        return await call.answer("Você precisa de pelo menos 2000 Materiais para converter.", show_alert=True)
+    # valida token
+    try:
+        _, token = call.data.split(":", 1)
+    except Exception:
+        return await call.answer("Essa interação expirou. Por favor, tente novamente.", show_alert=True)
+
+    ok, payload, err = cb_check_and_use(token, user_id, action="materials")
+    if not ok:
+        return await call.answer(err, show_alert=True)
 
 
     # unidades inteiras de (1000) que podem ser convertidas
@@ -1047,19 +1112,27 @@ async def abrir_swap_ton_cb(call: types.CallbackQuery):
         "Escolha um valor (mín. `20` cash) ou digite: `trocar 250`"
     )
 
+    # 🔒 gera token com validade (TTL) para cada botão
+    tok20  = cb_new(user_id, action="swap", payload="20",  ttl=30)
+    tok50  = cb_new(user_id, action="swap", payload="50",  ttl=30)
+    tok100 = cb_new(user_id, action="swap", payload="100", ttl=30)
+    tok500 = cb_new(user_id, action="swap", payload="500", ttl=30)
+    tokall = cb_new(user_id, action="swap", payload="all", ttl=30)
+
     kb = types.InlineKeyboardMarkup(inline_keyboard=[
         [
-            types.InlineKeyboardButton(text="20 cash", callback_data="swap:20"),
-            types.InlineKeyboardButton(text="50", callback_data="swap:50"),
-            types.InlineKeyboardButton(text="100", callback_data="swap:100"),
+            types.InlineKeyboardButton(text="20 cash", callback_data=f"swap:20:{tok20}"),
+            types.InlineKeyboardButton(text="50",      callback_data=f"swap:50:{tok50}"),
+            types.InlineKeyboardButton(text="100",     callback_data=f"swap:100:{tok100}"),
         ],
         [
-            types.InlineKeyboardButton(text="500", callback_data="swap:500"),
-            types.InlineKeyboardButton(text="Tudo", callback_data="swap:all"),
+            types.InlineKeyboardButton(text="500",     callback_data=f"swap:500:{tok500}"),
+            types.InlineKeyboardButton(text="Tudo",    callback_data=f"swap:all:{tokall}"),
         ]
     ])
     await call.message.answer(texto, parse_mode="Markdown", reply_markup=kb)
     await call.answer()
+
 
 
 
@@ -1099,6 +1172,23 @@ async def trocar_cash(msg: types.Message):
 @dp.callback_query(F.data.startswith("swap:"))
 async def swap_cb(call: types.CallbackQuery):
     user_id = call.from_user.id
+
+    # Esperamos "swap:<amount>:<token>"
+    try:
+        _, amount_s, token = call.data.split(":", 2)
+    except Exception:
+        return await call.answer("Essa interação expirou. Por favor, tente novamente.", show_alert=True)
+
+    # 🔒 valida o token (expirado/uso único/pertence ao usuário/ação correta)
+    ok, payload, err = cb_check_and_use(token, user_id, action="swap")
+    if not ok:
+        return await call.answer(err, show_alert=True)
+
+    # Segurança extra: confere se o amount do botão bate com o payload gravado
+    if (payload or "") != amount_s:
+        return await call.answer("Essa interação não é mais válida. Por favor, tente novamente.", show_alert=True)
+
+    # ----------- (se passou, segue seu fluxo atual) -----------
     row = cur.execute(
         "SELECT COALESCE(saldo_cash_pagamentos,0), COALESCE(saldo_ton,0) FROM usuarios WHERE telegram_id=?",
         (user_id,)
@@ -1108,15 +1198,12 @@ async def swap_cb(call: types.CallbackQuery):
     preco_brl = get_ton_price_brl()
     cash_por_ton = max(1, int(round(preco_brl * CASH_POR_REAL)))
 
-    _, amount_s = call.data.split(":", 1)
     amount = saldo_pag if amount_s == "all" else int(amount_s)
 
     if amount < 20:
-        await call.answer("Mínimo 20 cash.", show_alert=True)
-        return
+        return await call.answer("Mínimo 20 cash.", show_alert=True)
     if amount > saldo_pag:
-        await call.answer("Saldo de pagamentos insuficiente.", show_alert=True)
-        return
+        return await call.answer("Saldo de pagamentos insuficiente.", show_alert=True)
 
     ton_out = amount / cash_por_ton
     cur.execute(
@@ -1131,6 +1218,7 @@ async def swap_cb(call: types.CallbackQuery):
         parse_mode="Markdown"
     )
     await call.answer()
+
 
 @dp.message(lambda m: m.text and m.text.lower().startswith("trocar "))
 async def trocar_texto(msg: types.Message):
