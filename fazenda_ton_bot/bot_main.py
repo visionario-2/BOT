@@ -1388,8 +1388,13 @@ async def processar_saque(msg: types.Message, state: FSMContext):
         row = c.execute("SELECT saldo_ton FROM usuarios WHERE telegram_id=?", (user_id,)).fetchone()
         saldo_ton = row["saldo_ton"] if row else 0.0
         if amount_ton > saldo_ton + 1e-9:
-            await state.clear()
-            return await msg.answer("Você não possui TON suficiente para este saque. Ajuste o valor e tente novamente.")
+            await state.set_state(WithdrawStates.waiting_amount_ton)
+            return await msg.answer(
+                "Você não possui TON suficiente para este saque. "
+                "Digite outro valor ou toque em ⬅️ Voltar.",
+                reply_markup=sacar_keyboard()
+            )
+
 
     # 2) Checar cofre do App (sem revelar números ao usuário)
     try:
