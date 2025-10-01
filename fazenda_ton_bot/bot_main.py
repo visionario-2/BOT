@@ -1407,12 +1407,13 @@ async def processar_saque(msg: types.Message, state: FSMContext):
                 break
 
         if ton_avail + 1e-9 < amount_ton:
-            await state.clear()
-            # mensagem genérica (NÃO revelar saldo do cofre)
+            await state.set_state(WithdrawStates.waiting_amount_ton)
             return await msg.answer(
                 "No momento não é possível processar esse saque. "
-                "Tente um valor menor ou aguarde reabastecimento."
+                "Digite outro valor ou toque em ⬅️ Voltar.",
+                reply_markup=sacar_keyboard()
             )
+
     except Exception as e:
         logging.warning(f"[payout] get_app_balances falhou: {e}")
 
