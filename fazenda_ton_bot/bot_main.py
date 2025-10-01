@@ -1533,7 +1533,7 @@ async def indicacao(msg: types.Message):
 @dp.message(F.text == "❓ Ajuda/Suporte")
 async def ajuda(msg: types.Message):
     await msg.answer(
-        "Dúvidas? Fale com o suporte: @seu_suporte\n\n"
+        "Dúvidas? Fale com o suporte: @SuporteAnimalTon\n\n"
         "• 🛒 Comprar animais com Cash Disponível (1 real = 100 cash)\n"
         "• 💰 Depositar via Crypto Pay (USDT/TON cobrados em BRL)\n"
         "• 🔄 Trocas (Materiais → Cash e Cash de Pagamentos → TON)\n"
