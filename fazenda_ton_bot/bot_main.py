@@ -297,7 +297,12 @@ def ensure_schema():
         )
         """)
 
-        
+                # --- Índices úteis (desempenho em contagens/consultas) ---
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_indicacoes_por ON indicacoes(por)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_inventario_uid ON inventario(telegram_id)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_pag_user ON pagamentos(user_id)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_wd_user ON withdrawals(user_id)")
+
         conn.commit()
     finally:
         conn.close()
@@ -1543,6 +1548,20 @@ async def ajuda(msg: types.Message):
 
 
 # ===== COMANDOS DE ADMIN =====
+@dp.message(Command("whoami"))
+async def whoami(msg: types.Message):
+    await msg.answer(f"Seu ID: {msg.from_user.id}")
+
+@dp.message(Command("id"))
+async def get_replied_id(msg: types.Message):
+    if not is_admin(msg.from_user.id):
+        return
+    if not msg.reply_to_message:
+        return await msg.answer("Responda a uma mensagem da pessoa e envie /id.")
+    uid = msg.reply_to_message.from_user.id
+    name = (msg.reply_to_message.from_user.full_name or "").strip()
+    await msg.answer(f"ID do usuário: {uid}\nNome: {name}")
+
 @dp.message(Command("addcash"))
 async def add_cash(msg: types.Message):
     if not is_admin(msg.from_user.id):
@@ -1584,6 +1603,121 @@ async def add_ton(msg: types.Message):
     cur.execute("UPDATE usuarios SET saldo_ton=COALESCE(saldo_ton,0)+? WHERE telegram_id=?", (valor, uid))
     con.commit()
     await msg.answer(f"✅ Adicionado {valor} TON ao usuário {uid}")
+
+@dp.message(Command("setcash"))
+async def set_cash(msg: types.Message):
+    if not is_admin(msg.from_user.id):
+        return
+    try:
+        _, uid, valor = msg.text.split()
+        uid = int(uid); valor = float(valor)
+    except:
+        return await msg.answer("Uso: /setcash <user_id> <valor>")
+    cur.execute("UPDATE usuarios SET saldo_cash=? WHERE telegram_id=?", (valor, uid))
+    con.commit()
+    await msg.answer(f"✅ saldo_cash definido para {valor:.0f} (uid {uid})")
+
+@dp.message(Command("setpag"))
+async def set_pag(msg: types.Message):
+    if not is_admin(msg.from_user.id):
+        return
+    try:
+        _, uid, valor = msg.text.split()
+        uid = int(uid); valor = float(valor)
+    except:
+        return await msg.answer("Uso: /setpag <user_id> <valor>")
+    cur.execute("UPDATE usuarios SET saldo_cash_pagamentos=? WHERE telegram_id=?", (valor, uid))
+    con.commit()
+    await msg.answer(f"✅ saldo_cash_pagamentos definido para {valor:.0f} (uid {uid})")
+
+@dp.message(Command("setton"))
+async def set_ton(msg: types.Message):
+    if not is_admin(msg.from_user.id):
+        return
+    try:
+        _, uid, valor = msg.text.split()
+        uid = int(uid); valor = float(valor)
+    except:
+        return await msg.answer("Uso: /setton <user_id> <valor>")
+    cur.execute("UPDATE usuarios SET saldo_ton=? WHERE telegram_id=?", (valor, uid))
+    con.commit()
+    await msg.answer(f"✅ saldo_ton definido para {valor:.6f} (uid {uid})")
+
+@dp.message(Command("setmats"))
+async def set_mats(msg: types.Message):
+    if not is_admin(msg.from_user.id):
+        return
+    try:
+        _, uid, valor = msg.text.split()
+        uid = int(uid); valor = float(valor)
+    except:
+        return await msg.answer("Uso: /setmats <user_id> <valor>")
+    cur.execute("UPDATE usuarios SET saldo_materiais=? WHERE telegram_id=?", (valor, uid))
+    con.commit()
+    await msg.answer(f"✅ saldo_materiais definido para {valor:.0f} (uid {uid})")
+
+@dp.message(Command("resetsaldos"))
+async def reset_saldos(msg: types.Message):
+    if not is_admin(msg.from_user.id):
+        return
+    try:
+        _, uid = msg.text.split()
+        uid = int(uid)
+    except:
+        return await msg.answer("Uso: /resetsaldos <user_id>")
+    cur.execute("""
+        UPDATE usuarios SET
+            saldo_cash=0,
+            saldo_cash_pagamentos=0,
+            saldo_ton=0,
+            saldo_materiais=0
+        WHERE telegram_id=?
+    """, (uid,))
+    con.commit()
+    await msg.answer(f"✅ Saldos zerados (uid {uid}).")
+
+@dp.message(Command("resetuser"))
+async def reset_user(msg: types.Message):
+    if not is_admin(msg.from_user.id):
+        return
+    parts = (msg.text or "").split()
+    if len(parts) < 2:
+        return await msg.answer("Uso: /resetuser <user_id> [soft|hard]")
+    uid = int(parts[1])
+    mode = parts[2].lower() if len(parts) >= 3 else "soft"
+
+    if mode not in {"soft","hard"}:
+        return await msg.answer("Modo inválido. Use: soft ou hard.")
+
+    # SOFT: zera saldos e limpa inventário
+    cur.execute("""
+        UPDATE usuarios SET
+            saldo_cash=0,
+            saldo_cash_pagamentos=0,
+            saldo_ton=0,
+            saldo_materiais=0
+        WHERE telegram_id=?
+    """, (uid,))
+    cur.execute("DELETE FROM inventario WHERE telegram_id=?", (uid,))
+    # (opcional) remover a carteira para o usuário reconfigurar:
+    # cur.execute("UPDATE usuarios SET carteira_ton=NULL WHERE telegram_id=?", (uid,))
+    con.commit()
+
+    if mode == "soft":
+        return await msg.answer(f"✅ Reset SOFT aplicado ao uid {uid} (saldos zerados e inventário limpo).")
+
+    # HARD: apaga tudo relacionado ao usuário
+    cur.execute("DELETE FROM saques WHERE telegram_id=?", (uid,))
+    cur.execute("DELETE FROM withdrawals WHERE user_id=?", (uid,))
+    # Se quiser manter histórico financeiro, comente as duas linhas abaixo:
+    cur.execute("DELETE FROM pagamentos WHERE user_id=?", (uid,))
+    # Remove indicação como indicado e como indicador
+    cur.execute("DELETE FROM indicacoes WHERE quem=? OR por=?", (uid, uid))
+    # Por fim, remove o registro do usuário
+    cur.execute("DELETE FROM usuarios WHERE telegram_id=?", (uid,))
+    con.commit()
+    await msg.answer(f"🗑️ Reset HARD aplicado ao uid {uid} (conta e dados removidos).")
+
 
 @dp.message(Command("appsaldo"))
 async def app_saldo(msg: types.Message):
