@@ -1,5 +1,5 @@
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 import hashlib
 import hmac
 import requests
@@ -1556,6 +1556,49 @@ async def ajuda(msg: types.Message):
 
 
 # ===== COMANDOS DE ADMIN =====
+@dp.message(Command("users"))
+async def users_count(msg: types.Message):
+    if not is_admin(msg.from_user.id):
+        return
+    row = cur.execute("SELECT COUNT(*) FROM usuarios").fetchone()
+    total = row[0] if row else 0
+    await msg.answer(f"👥 Total de usuários cadastrados: {total}")
+
+@dp.message(Command("users30"))
+async def users_last_30_days(msg: types.Message):
+    if not is_admin(msg.from_user.id):
+        return
+    since = (datetime.now() - timedelta(days=30)).isoformat()
+    row = cur.execute("SELECT COUNT(*) FROM usuarios WHERE criado_em >= ?", (since,)).fetchone()
+    total = row[0] if row else 0
+    await msg.answer(f"📈 Novos usuários nos últimos 30 dias: {total}")
+
+@dp.message(Command("payers"))
+async def payer_count(msg: types.Message):
+    if not is_admin(msg.from_user.id):
+        return
+    row = cur.execute("SELECT COUNT(DISTINCT user_id) FROM pagamentos").fetchone()
+    total = row[0] if row else 0
+    await msg.answer(f"💳 Usuários que já depositaram pelo menos uma vez: {total}")
+
+# (opcional) tudo junto num comando só:
+@dp.message(Command("stats"))
+async def stats(msg: types.Message):
+    if not is_admin(msg.from_user.id):
+        return
+    users = cur.execute("SELECT COUNT(*) FROM usuarios").fetchone()[0]
+    since = (datetime.now() - timedelta(days=30)).isoformat()
+    users30 = cur.execute("SELECT COUNT(*) FROM usuarios WHERE criado_em >= ?", (since,)).fetchone()[0]
+    payers = cur.execute("SELECT COUNT(DISTINCT user_id) FROM pagamentos").fetchone()[0]
+    await msg.answer(
+        "📊 *Estatísticas*\n"
+        f"• 👥 Usuários: *{users}*\n"
+        f"• 📈 Novos (30d): *{users30}*\n"
+        f"• 💳 Já pagaram: *{payers}*",
+        parse_mode="Markdown"
+    )
+
+
 @dp.message(Command("whoami"))
 async def whoami(msg: types.Message):
     await msg.answer(f"Seu ID: {msg.from_user.id}")
