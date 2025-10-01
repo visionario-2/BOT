@@ -284,7 +284,7 @@ def ensure_schema():
           updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
         """)
-        
+
         conn.execute("""
         CREATE TABLE IF NOT EXISTS cb_tokens (
             id TEXT PRIMARY KEY,
@@ -297,15 +297,16 @@ def ensure_schema():
         )
         """)
 
-                # --- Índices úteis (desempenho em contagens/consultas) ---
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_indicacoes_por ON indicacoes(por)")
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_inventario_uid ON inventario(telegram_id)")
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_pag_user ON pagamentos(user_id)")
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_wd_user ON withdrawals(user_id)")
+        # --- Índices úteis (desempenho em contagens/consultas) ---
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_indicacoes_por ON indicacoes(por)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_inventario_uid ON inventario(telegram_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_pag_user ON pagamentos(user_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_wd_user ON withdrawals(user_id)")
 
         conn.commit()
     finally:
         conn.close()
+
 
 
 
