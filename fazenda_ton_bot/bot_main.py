@@ -146,9 +146,16 @@ async def _refresh_price_loop():
 
 # ========= CONFIG ==========
 TOKEN = os.getenv('TOKEN')
-OWNER_ID = int(os.getenv("OWNER_TELEGRAM_ID", "0"))
+# IDs de admins (pode ter vários)
+ADMINS = [
+    int(os.getenv("OWNER_TELEGRAM_ID", "0")),   # já configurado no ambiente
+    8304762651,  # <-- coloque aqui o ID do seu perfil de suporte
+    # pode adicionar mais IDs se quiser
+]
+
 def is_admin(uid: int) -> bool:
-    return OWNER_ID and uid == OWNER_ID
+    return uid in ADMINS
+
 
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "SEU_BOT_USERNAME")
