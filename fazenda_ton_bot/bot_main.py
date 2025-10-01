@@ -1362,6 +1362,7 @@ async def iniciar_pagamento(msg: types.Message, state: FSMContext):
 
 @dp.message(StateFilter(WithdrawStates.waiting_amount_ton))
 async def processar_saque(msg: types.Message, state: FSMContext):
+    # 0) Parse do valor
     try:
         amount_ton = float((msg.text or "").replace(",", "."))
         if amount_ton <= 0:
@@ -1376,40 +1377,42 @@ async def processar_saque(msg: types.Message, state: FSMContext):
     wallet = get_wallet(user_id)
     if not wallet:
         await state.clear()
-        return await msg.answer("Wallet não encontrada. Cadastre sua **Wallet TON** e tente novamente.")
+        return await msg.answer(
+            "Você ainda não definiu sua **Wallet TON**. Toque em *Wallet TON* e cadastre antes de sacar.",
+            parse_mode="Markdown",
+            reply_markup=sacar_keyboard()
+        )
 
-    # 1) Checar saldo do App ANTES de reservar o saldo do usuário
+    # 1) Checar saldo do USUÁRIO ANTES de olhar o cofre (não tenta processar se não houver saldo)
+    with db_conn() as c:
+        row = c.execute("SELECT saldo_ton FROM usuarios WHERE telegram_id=?", (user_id,)).fetchone()
+        saldo_ton = row["saldo_ton"] if row else 0.0
+        if amount_ton > saldo_ton + 1e-9:
+            await state.clear()
+            return await msg.answer("Você não possui TON suficiente para este saque. Ajuste o valor e tente novamente.")
+
+    # 2) Checar cofre do App (sem revelar números ao usuário)
     try:
         balances = get_app_balances()
-        ton_avail, ton_locked = 0.0, 0.0
+        ton_avail = 0.0
         for b in balances:
-            code = _balance_code(b)  # <-- usa o helper novo
+            code = _balance_code(b)
             if code == "TON":
                 ton_avail = float(b.get("available") or 0)
-                ton_locked = float(b.get("locked") or 0)
                 break
 
         if ton_avail + 1e-9 < amount_ton:
             await state.clear()
+            # mensagem genérica (NÃO revelar saldo do cofre)
             return await msg.answer(
-                f"⚠️ O cofre do app não tem TON suficiente.\n"
-                f"Disponível: {ton_avail:.6f} TON | Bloqueado: {ton_locked:.6f} TON\n"
+                "No momento não é possível processar esse saque. "
                 "Tente um valor menor ou aguarde reabastecimento."
             )
     except Exception as e:
         logging.warning(f"[payout] get_app_balances falhou: {e}")
 
-    
-    # 2) Checar e reservar saldo TON do usuário
+    # 3) Reservar saldo do usuário AGORA (só depois das checagens acima)
     with db_conn() as c:
-        row = c.execute("SELECT saldo_ton FROM usuarios WHERE telegram_id=?", (user_id,)).fetchone()
-        saldo_ton = row["saldo_ton"] if row else 0.0
-        if saldo_ton + 1e-9 < amount_ton:
-            await state.clear()
-            return await msg.answer(
-                f"Saldo TON insuficiente para sacar {amount_ton:.6f} TON. "
-                f"Seu saldo é {saldo_ton:.6f} TON."
-            )
         c.execute("UPDATE usuarios SET saldo_ton = saldo_ton - ? WHERE telegram_id=?", (amount_ton, user_id))
 
     idemp = new_idempotency_key(user_id)
@@ -1418,7 +1421,7 @@ async def processar_saque(msg: types.Message, state: FSMContext):
     await msg.answer("⏳ Processando seu saque…")
 
     try:
-        # 3) Payout direto (se habilitado)
+        # 4) Payout direto
         await cryptopay_transfer_ton_to_address(amount_ton, wallet, idemp)
         set_withdraw_status(wid, "done")
         await msg.answer(
@@ -1428,13 +1431,12 @@ async def processar_saque(msg: types.Message, state: FSMContext):
 
     except CryptoPayError as e:
         err = str(e)
-        # 4) se não houver payouts habilitados → fallback: criar Check
+        # 5) Fallback para Check, caso payouts estejam desabilitados
         if "METHOD_NOT_FOUND" in err or "createPayout" in err or "METHOD_DISABLED" in err:
             try:
                 chk = criar_check_ton(amount_ton)
                 set_withdraw_status(wid, "done")
 
-                # 1) tente o campo oficial que já vem pronto para o usuário
                 link = (
                     chk.get("bot_check_url")
                     or chk.get("check_url")
@@ -1442,9 +1444,8 @@ async def processar_saque(msg: types.Message, state: FSMContext):
                     or (f"https://t.me/CryptoBot?start=check_{chk.get('hash')}" if chk.get("hash") else "")
                 )
 
-                # 2) se mesmo assim não tiver link, avise claramente o admin
                 if not link:
-                    # estorna o saldo do usuário, pois não conseguimos entregar o link
+                    # estorna, pois não conseguimos entregar o link
                     with db_conn() as c:
                         c.execute(
                             "UPDATE usuarios SET saldo_ton = saldo_ton + ? WHERE telegram_id=?",
@@ -1452,18 +1453,15 @@ async def processar_saque(msg: types.Message, state: FSMContext):
                         )
                     set_withdraw_status(wid, "failed")
                     return await msg.answer(
-                        "❌ Check criado, mas não recebi o link de resgate da API.\n"
-                        "Avise o suporte/admin para verificar o método createCheck e os campos retornados.",
+                        "❌ Não foi possível gerar o link de resgate agora. Tente novamente mais tarde."
                     )
 
-                # 3) envie um botão com o link (evita problemas de parse_mode)
                 kb = types.InlineKeyboardMarkup(
                     inline_keyboard=[[types.InlineKeyboardButton(text="🔗 Resgatar no @CryptoBot", url=link)]]
                 )
                 await msg.answer(
                     "✅ Saque criado como *Check do CryptoBot*.\n\n"
-                    "Toque no botão abaixo para resgatar o TON na sua carteira do @CryptoBot.\n"
-                    "Depois você pode sacar on-chain para qualquer endereço.",
+                    "Toque no botão abaixo para resgatar o TON na sua carteira do @CryptoBot.",
                     parse_mode="Markdown",
                     reply_markup=kb
                 )
@@ -1477,14 +1475,11 @@ async def processar_saque(msg: types.Message, state: FSMContext):
                     )
                 set_withdraw_status(wid, "failed")
                 await msg.answer(
-                    "❌ Não foi possível completar o saque agora (fallback para Check falhou).\n"
-                    f"Detalhe: `{str(ee)[:200]}`\n"
-                    "O valor foi estornado para seu saldo TON. Tente novamente mais tarde.",
-                    parse_mode="Markdown"
+                    "❌ Não foi possível completar o saque agora. O valor foi estornado para seu saldo TON.",
                 )
 
         else:
-            # outro erro qualquer → estorna
+            # outro erro → estorna
             with db_conn() as c:
                 c.execute(
                     "UPDATE usuarios SET saldo_ton = saldo_ton + ? WHERE telegram_id=?",
@@ -1492,13 +1487,11 @@ async def processar_saque(msg: types.Message, state: FSMContext):
                 )
             set_withdraw_status(wid, "failed")
             await msg.answer(
-                "❌ Não foi possível completar o saque agora.\n"
-                f"Detalhe: `{err[:200]}`\n"
-                "O valor foi estornado para seu saldo TON. Tente novamente mais tarde.",
-                parse_mode="Markdown"
+                "❌ Não foi possível completar o saque agora. O valor foi estornado para seu saldo TON."
             )
     finally:
         await state.clear()
+
 
 
 @dp.message(F.text == "👫 Indique & Ganhe")
