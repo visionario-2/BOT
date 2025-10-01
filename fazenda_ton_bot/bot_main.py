@@ -954,7 +954,7 @@ async def coletar_rendimento_cb(call: types.CallbackQuery):
         "📥 *Coleta concluída!*\n\n"
         f"• Você coletou: *+{total:.0f}* 🧱\n"
         f"• Materiais agora: *{novo_saldo:.0f}* 🧱\n\n"
-        "_Use **🔄 Trocas** para converter Materiais → Cash._",
+        "_Use 🔄 Trocas para converter Materiais → Cash._",
         parse_mode="Markdown"
     )
     await call.answer()
@@ -972,7 +972,7 @@ async def depositar_menu(msg: types.Message):
         ],
         resize_keyboard=True
     )
-    await msg.answer("Escolha o valor do depósito em **reais**:", reply_markup=kb, parse_mode="Markdown")
+    await msg.answer("Escolha o valor do depósito em **reais** (💵R$ 1,00 = 100 cash):", reply_markup=kb, parse_mode="Markdown")
 
 def _parse_reais(txt: str):
     t = txt.upper().replace("R$", "").strip().replace(",", ".")
@@ -1111,7 +1111,7 @@ async def abrir_swap_ton_cb(call: types.CallbackQuery):
         f"Preço atual: `1 TON ≈ R$ {preco_brl:.2f}`\n"
         f"Equivalência: `1 TON ≈ {cash_por_ton} cash`\n\n"
         f"Seu cash de pagamentos disponível: `{saldo_pag:.0f}`\n\n"
-        "Escolha um valor (mín. `20` cash) ou digite: `trocar 250`"
+        "Escolha um valor (mín. `20` cash) ou digite, exemplo: `trocar 250`"
     )
 
     # 🔒 gera token com validade (TTL) para cada botão
@@ -1219,14 +1219,22 @@ async def swap_cb(call: types.CallbackQuery):
         "UPDATE usuarios SET saldo_cash_pagamentos=saldo_cash_pagamentos-?, saldo_ton=saldo_ton+? WHERE telegram_id=?",
         (amount, ton_out, user_id)
     )
+    
     con.commit()
 
+    # lê o novo saldo TON do usuário
+    row_new = cur.execute(
+        "SELECT COALESCE(saldo_ton,0) FROM usuarios WHERE telegram_id=?",
+        (user_id,)
+    ).fetchone()
+    novo_saldo_ton = row_new[0] if row_new else 0.0
+
     await call.message.answer(
-        f"✅ Convertidos `{amount}` cash pagamentos → `{ton_out:.5f}` TON\n"
-        f"`1 TON = {cash_por_ton} cash` (≈ R$ {preco_brl:.2f}).",
+        f"✅ Convertidos `{amount}` cash de pagamentos → `+{ton_out:.5f}` TON\n"
+        f"💎 Novo saldo TON: `{novo_saldo_ton:.5f}`",
         parse_mode="Markdown"
     )
-    await call.answer()
+
 
 
 @dp.message(lambda m: m.text and m.text.lower().startswith("trocar "))
@@ -1262,11 +1270,19 @@ async def trocar_texto(msg: types.Message):
     )
     con.commit()
 
+    # lê o novo saldo TON do usuário
+    row_new = cur.execute(
+        "SELECT COALESCE(saldo_ton,0) FROM usuarios WHERE telegram_id=?",
+        (user_id,)
+    ).fetchone()
+    novo_saldo_ton = row_new[0] if row_new else 0.0
+
     await msg.answer(
-        f"✅ Convertidos `{amount}` cash pagamentos → `{ton_out:.5f}` TON\n"
-        f"`1 TON = {cash_por_ton} cash` (≈ R$ {preco_brl:.2f}).",
+        f"✅ Convertidos `{amount}` cash de pagamentos → `+{ton_out:.5f}` TON\n"
+        f"💎 Novo saldo TON: `{novo_saldo_ton:.5f}`",
         parse_mode="Markdown"
     )
+
 
 # ===== Saque =====
 @dp.message(F.text == "🏦 Sacar")
@@ -1518,7 +1534,7 @@ async def indicacao(msg: types.Message):
 async def ajuda(msg: types.Message):
     await msg.answer(
         "Dúvidas? Fale com o suporte: @seu_suporte\n\n"
-        "• 🛒 Comprar animais com Cash Disponível\n"
+        "• 🛒 Comprar animais com Cash Disponível (1 real = 100 cash)\n"
         "• 💰 Depositar via Crypto Pay (USDT/TON cobrados em BRL)\n"
         "• 🔄 Trocas (Materiais → Cash e Cash de Pagamentos → TON)\n"
         "• 🏦 Sacar TON para sua carteira\n\n"
