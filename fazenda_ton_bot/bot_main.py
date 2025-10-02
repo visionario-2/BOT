@@ -185,6 +185,36 @@ def _column_exists(conn, table, column):
     cur = conn.execute(f"PRAGMA table_info({table})")
     return any(r[1] == column for r in cur.fetchall())
 
+def sweep_old_withdraw_locks(user_id: int | None = None, max_age_minutes: int = 15) -> int:
+    """
+    Marca como 'failed' quaisquer withdrawals 'pending'/'processing' mais antigos que max_age_minutes.
+    Retorna quantos registros foram atualizados.
+    """
+    with db_conn() as c:
+        if user_id is not None:
+            res = c.execute(
+                """
+                UPDATE withdrawals
+                   SET status='failed', updated_at=CURRENT_TIMESTAMP
+                 WHERE status IN ('pending','processing')
+                   AND created_at <= DATETIME('now', ?)
+                   AND user_id = ?
+                """,
+                (f'-{max_age_minutes} minutes', user_id)
+            )
+        else:
+            res = c.execute(
+                """
+                UPDATE withdrawals
+                   SET status='failed', updated_at=CURRENT_TIMESTAMP
+                 WHERE status IN ('pending','processing')
+                   AND created_at <= DATETIME('now', ?)
+                """,
+                (f'-{max_age_minutes} minutes',)
+            )
+        return res.rowcount or 0
+
+
 def db_conn():
     conn = sqlite3.connect(DB_PATH, timeout=30, isolation_level=None)
     conn.row_factory = sqlite3.Row
@@ -855,8 +885,10 @@ async def comprar_animal_cb(call: types.CallbackQuery):
     await call.answer()
 
 @dp.message(F.text == "⬅️ Voltar")
-async def voltar(msg: types.Message):
+async def voltar(msg: types.Message, state: FSMContext):
+    await state.clear()          # <<< garante sair de qualquer FSM
     await start(msg)
+
 
 @dp.message(F.text == "🐾 Meus Animais")
 async def meus_animais(msg: types.Message):
@@ -925,8 +957,9 @@ async def coletar_rendimento_cb(call: types.CallbackQuery):
     await call.answer()
 
 # ===== Depósito via Crypto Pay (BRL) =====
-@dp.message(StateFilter(None), F.text == "➕ Depositar")
-async def depositar_menu(msg: types.Message):
+@dp.message(StateFilter("*"), F.text == "➕ Depositar")
+async def depositar_menu(msg: types.Message, state: FSMContext):
+    await state.clear()  # <<< limpa qualquer estado pendente
     kb = types.ReplyKeyboardMarkup(
         keyboard=[
             [types.KeyboardButton(text="R$ 10"), types.KeyboardButton(text="R$ 25")],
@@ -1316,11 +1349,12 @@ async def iniciar_pagamento(msg: types.Message, state: FSMContext):
 
 @dp.message(StateFilter(WithdrawStates.waiting_amount_ton))
 async def processar_saque(msg: types.Message, state: FSMContext):
+    # 0) Parse do valor
     try:
         amount_ton = float((msg.text or "").replace(",", "."))
         if amount_ton <= 0:
             return await msg.answer("Valor inválido. Envie um número maior que zero.")
-    except:
+    except Exception:
         return await msg.answer("Não entendi. Envie apenas o **número** (ex.: 1.25).")
 
     if amount_ton < 0.1:
@@ -1336,17 +1370,13 @@ async def processar_saque(msg: types.Message, state: FSMContext):
             reply_markup=sacar_keyboard()
         )
 
-    # 1) Bloqueio: não permitir múltiplos saques simultâneos
-    with db_conn() as c:
-        r = c.execute(
-            "SELECT COUNT(*) AS n FROM withdrawals WHERE user_id=? AND status='processing'",
-            (user_id,)
-        ).fetchone()
-        if (r["n"] if isinstance(r, sqlite3.Row) else r[0]) > 0:
-            await state.set_state(WithdrawStates.waiting_amount_ton)
-            return await msg.answer("Você já tem um saque em processamento. Aguarde finalizar.")
+    # 1) Varrer travas antigas deste usuário (expiram em 15min)
+    try:
+        sweep_old_withdraw_locks(user_id, max_age_minutes=15)
+    except Exception as e:
+        logging.warning("[withdraw] sweep user lock falhou: %s", e)
 
-    # 2) Checar saldo do USUÁRIO antes de cofre (mesmo feedback já existe)
+    # 2) Primeiro, checar saldo do usuário (não cria lock se não tiver saldo)
     with db_conn() as c:
         row = c.execute("SELECT saldo_ton FROM usuarios WHERE telegram_id=?", (user_id,)).fetchone()
         saldo_ton = row["saldo_ton"] if row else 0.0
@@ -1358,13 +1388,12 @@ async def processar_saque(msg: types.Message, state: FSMContext):
                 reply_markup=sacar_keyboard()
             )
 
-    # 3) Checar cofre do App (sem revelar números ao usuário)
+    # 3) Checar cofre do App (sem revelar números)
     try:
         balances = get_app_balances()
         ton_avail = 0.0
         for b in balances:
-            code = _balance_code(b)
-            if code == "TON":
+            if _balance_code(b) == "TON":
                 ton_avail = float(b.get("available") or 0)
                 break
         if ton_avail + 1e-9 < amount_ton:
@@ -1377,7 +1406,25 @@ async def processar_saque(msg: types.Message, state: FSMContext):
     except Exception as e:
         logging.warning(f"[payout] get_app_balances falhou: {e}")
 
-    # 4) Reservar saldo do usuário ATOMICAMENTE (sem corrida)
+    # 4) Bloqueio: impedir múltiplos saques simultâneos RECENTES
+    #    — e APENAS se estiver realmente 'processing' (não considera 'pending')
+    with db_conn() as c:
+        r = c.execute(
+            """
+            SELECT COUNT(*) AS n
+              FROM withdrawals
+             WHERE user_id = ?
+               AND status = 'processing'
+               AND created_at > DATETIME('now', '-15 minutes')
+            """,
+            (user_id,)
+        ).fetchone()
+        n_locked = (r["n"] if isinstance(r, sqlite3.Row) else r[0]) if r else 0
+        if n_locked > 0:
+            await state.set_state(WithdrawStates.waiting_amount_ton)
+            return await msg.answer("Você já tem um saque em processamento. Aguarde finalizar.")
+
+    # 5) Reservar saldo do usuário ATOMICAMENTE (sem corrida)
     with db_conn() as c:
         cur2 = c.execute(
             "UPDATE usuarios SET saldo_ton = saldo_ton - ? WHERE telegram_id=? AND saldo_ton >= ?",
@@ -1391,13 +1438,14 @@ async def processar_saque(msg: types.Message, state: FSMContext):
                 reply_markup=sacar_keyboard()
             )
 
+    # 6) Registrar withdrawal e marcar como 'processing'
     idemp = new_idempotency_key(user_id)
     wid = create_withdraw(user_id, requested_ton=amount_ton, wallet=wallet, idemp=idemp)
     set_withdraw_status(wid, "processing")
     await msg.answer("⏳ Processando seu saque…")
 
     try:
-        # 5) Payout direto
+        # 7) Tentar payout direto on-chain
         await cryptopay_transfer_ton_to_address(amount_ton, wallet, idemp)
         set_withdraw_status(wid, "done")
         await msg.answer(
@@ -1407,7 +1455,8 @@ async def processar_saque(msg: types.Message, state: FSMContext):
 
     except CryptoPayError as e:
         err = str(e)
-        # 6) Fallback para Check
+
+        # 8) Fallback para Check (quando createPayout estiver desabilitado)
         if "METHOD_NOT_FOUND" in err or "createPayout" in err or "METHOD_DISABLED" in err:
             try:
                 chk = criar_check_ton(amount_ton)
@@ -1421,7 +1470,7 @@ async def processar_saque(msg: types.Message, state: FSMContext):
                 )
 
                 if not link:
-                    # estorna
+                    # estorna, pois não conseguimos entregar o link
                     with db_conn() as c:
                         c.execute(
                             "UPDATE usuarios SET saldo_ton = saldo_ton + ? WHERE telegram_id=?",
@@ -1455,7 +1504,7 @@ async def processar_saque(msg: types.Message, state: FSMContext):
                 )
 
         else:
-            # outro erro → estorna
+            # outro erro qualquer → estorna
             with db_conn() as c:
                 c.execute(
                     "UPDATE usuarios SET saldo_ton = saldo_ton + ? WHERE telegram_id=?",
@@ -1465,8 +1514,10 @@ async def processar_saque(msg: types.Message, state: FSMContext):
             await msg.answer(
                 "❌ Não foi possível completar o saque agora. O valor foi estornado para seu saldo TON."
             )
+
     finally:
         await state.clear()
+        
 
 @dp.message(F.text == "👫 Indique & Ganhe")
 async def indicacao(msg: types.Message):
@@ -1750,6 +1801,15 @@ async def on_startup():
         logging.info("[startup] webhook deletado")
     except Exception as e:
         logging.warning("[startup] delete_webhook falhou, mas vou ignorar: %s", e)
+
+        # limpeza preventiva de travas antigas (15 minutos)
+    try:
+        n = sweep_old_withdraw_locks(None, max_age_minutes=15)
+        if n:
+            logging.info("[startup] sweep de withdrawals antigos: %s corrigidos", n)
+    except Exception as e:
+        logging.warning("[startup] sweep_old_withdraw_locks erro: %s", e)
+
 
     asyncio.create_task(_run_polling_forever())
     asyncio.create_task(_refresh_price_loop())
