@@ -1339,11 +1339,10 @@ async def processar_saque(msg: types.Message, state: FSMContext):
     # 1) Bloqueio: não permitir múltiplos saques simultâneos
     with db_conn() as c:
         r = c.execute(
-            "SELECT COUNT(*) AS n FROM withdrawals WHERE user_id=? AND status IN ('pending','processing')",
+            "SELECT COUNT(*) AS n FROM withdrawals WHERE user_id=? AND status='processing'",
             (user_id,)
         ).fetchone()
-        n_locked = (r["n"] if isinstance(r, sqlite3.Row) else r[0]) if r else 0
-        if n_locked > 0:
+        if (r["n"] if isinstance(r, sqlite3.Row) else r[0]) > 0:
             await state.set_state(WithdrawStates.waiting_amount_ton)
             return await msg.answer("Você já tem um saque em processamento. Aguarde finalizar.")
 
