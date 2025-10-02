@@ -4,19 +4,21 @@ import hashlib
 import hmac
 import requests
 import httpx
-import re, uuid, time, os, sqlite3
-import logging
-logging.basicConfig(level=logging.INFO)
+import re, uuid, time, os, sqlite3, json, logging
+from collections import defaultdict
 
-from aiogram import Bot, Dispatcher, F, types
+from aiogram import Bot, Dispatcher, F, types, BaseMiddleware
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
 import uvicorn
 
+from aiohttp import ClientTimeout  # (mantido para compatibilidade)
+
+logging.basicConfig(level=logging.INFO)
 
 # ===== MATERIAIS / CONVERSÕES =====
 MATERIAIS_DIVISOR = 1000.0        # cada 1000 materiais viram 1 "unidade base"
@@ -24,12 +26,9 @@ MATERIAIS_PCT_PAG = 0.40          # 40% vai para Cash de Pagamentos
 MATERIAIS_PCT_CASH = 0.60         # 60% vai para Cash Disponível
 MATERIAIS_MIN_VENDA = 2000.0      # quantidade mínima para vender
 
-
 # ===== Preço do TON em BRL – robusto, com cache, retries e múltiplas fontes =====
-
 PRICE_CACHE_SECONDS = int(os.getenv("PRICE_CACHE_SECONDS", "60"))  # TTL do cache (s)
 FALLBACK_TON_BRL = float(os.getenv("FALLBACK_TON_BRL", "17.0"))
-
 _TON_CACHE = {"price": FALLBACK_TON_BRL, "ts": 0.0}
 
 COINGECKO_SIMPLE = "https://api.coingecko.com/api/v3/simple/price"
@@ -109,30 +108,38 @@ def _ton_brl_from_usdt_paths():
         return 0.0
     return usdt_price * usd_brl
 
+def _median(xs):
+    xs = sorted(x for x in xs if _is_sane_brl(x))
+    if not xs:
+        return 0.0
+    n = len(xs)
+    return xs[n//2] if n % 2 else (xs[n//2 - 1] + xs[n//2]) / 2.0
+
+MAX_JUMP = 0.10  # 10% por refresh
+
 def get_ton_price_brl() -> float:
     now = time.time()
     if (now - _TON_CACHE["ts"] < PRICE_CACHE_SECONDS) and _TON_CACHE["price"] > 0:
         return _TON_CACHE["price"]
 
-    price = _try_with_retries(_cg_simple_brl)
-    if not _is_sane_brl(price):
-        price = 0.0
+    candidates = [
+        _try_with_retries(_cg_simple_brl),
+        _try_with_retries(_cg_markets_brl),
+        _try_with_retries(_ton_brl_from_usdt_paths),
+    ]
+    med = _median(candidates)
+    if med <= 0:
+        return _TON_CACHE["price"]  # staleness guard
 
-    if price <= 0.0:
-        price = _try_with_retries(_cg_markets_brl)
-        if not _is_sane_brl(price):
-            price = 0.0
+    prev = _TON_CACHE["price"]
+    if prev > 0:
+        upper = prev * (1 + MAX_JUMP)
+        lower = prev * (1 - MAX_JUMP)
+        med = min(max(med, lower), upper)
 
-    if price <= 0.0:
-        price = _try_with_retries(_ton_brl_from_usdt_paths)
-        if not _is_sane_brl(price):
-            price = 0.0
-
-    if price > 0.0:
-        _TON_CACHE["price"] = price
-        _TON_CACHE["ts"] = now
-
-    return _TON_CACHE["price"]
+    _TON_CACHE["price"] = med
+    _TON_CACHE["ts"] = now
+    return med
 
 PRICE_REFRESH_SECONDS = int(os.getenv("PRICE_REFRESH_SECONDS", "45"))
 
@@ -146,23 +153,29 @@ async def _refresh_price_loop():
 
 # ========= CONFIG ==========
 TOKEN = os.getenv('TOKEN')
-# IDs de admins (pode ter vários)
-ADMINS = [
-    int(os.getenv("OWNER_TELEGRAM_ID", "0")),   # já configurado no ambiente
-    8304762651,  # <-- coloque aqui o ID do seu perfil de suporte
-    # pode adicionar mais IDs se quiser
-]
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")
+BOT_USERNAME = os.getenv("BOT_USERNAME", "SEU_BOT_USERNAME")
+
+# ===== Admins por ENV e chat privado =====
+def is_private_chat(msg: types.Message) -> bool:
+    return getattr(getattr(msg, "chat", None), "type", "") == "private"
+
+ADMINS = set()
+_owner = int(os.getenv("OWNER_TELEGRAM_ID", "0")) or 0
+if _owner:
+    ADMINS.add(_owner)
+try:
+    extra = json.loads(os.getenv("ADMINS_JSON", "[]"))
+    ADMINS.update(int(x) for x in extra)
+except Exception:
+    pass
 
 def is_admin(uid: int) -> bool:
     return uid in ADMINS
 
-
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")
-BOT_USERNAME = os.getenv("BOT_USERNAME", "SEU_BOT_USERNAME")
-
 # ========= DB ==========
 DB_PATH = os.getenv("DB_PATH", "/data/db.sqlite3")
-print("DB_PATH em uso:", DB_PATH)
+# logging.debug("DB_PATH em uso")  # use debug em produção, se quiser
 
 db_dir = os.path.dirname(DB_PATH)
 if db_dir:
@@ -172,64 +185,66 @@ def _column_exists(conn, table, column):
     cur = conn.execute(f"PRAGMA table_info({table})")
     return any(r[1] == column for r in cur.fetchall())
 
-# conexão global usada por partes do código
-con = sqlite3.connect(DB_PATH, check_same_thread=False)
-cur = con.cursor()
+def db_conn():
+    conn = sqlite3.connect(DB_PATH, timeout=30, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("PRAGMA busy_timeout=30000;")
+    return conn
 
 def init_db():
-    cur.execute('''CREATE TABLE IF NOT EXISTS usuarios (
-        telegram_id INTEGER PRIMARY KEY,
-        saldo_cash REAL DEFAULT 0,
-        saldo_ton REAL DEFAULT 0,
-        carteira_ton TEXT,
-        criado_em TEXT
-    )''')
+    with db_conn() as c:
+        c.execute('''CREATE TABLE IF NOT EXISTS usuarios (
+            telegram_id INTEGER PRIMARY KEY,
+            saldo_cash REAL DEFAULT 0,
+            saldo_ton REAL DEFAULT 0,
+            carteira_ton TEXT,
+            criado_em TEXT
+        )''')
 
-    cur.execute('''CREATE TABLE IF NOT EXISTS animais (
-        nome TEXT PRIMARY KEY,
-        preco INTEGER,
-        rendimento REAL,
-        emoji TEXT
-    )''')
+        c.execute('''CREATE TABLE IF NOT EXISTS animais (
+            nome TEXT PRIMARY KEY,
+            preco INTEGER,
+            rendimento REAL,
+            emoji TEXT
+        )''')
 
-    cur.execute('''CREATE TABLE IF NOT EXISTS inventario (
-        telegram_id INTEGER,
-        animal TEXT,
-        quantidade INTEGER DEFAULT 0,
-        ultima_coleta TEXT,
-        PRIMARY KEY (telegram_id, animal)
-    )''')
+        c.execute('''CREATE TABLE IF NOT EXISTS inventario (
+            telegram_id INTEGER,
+            animal TEXT,
+            quantidade INTEGER DEFAULT 0,
+            ultima_coleta TEXT,
+            PRIMARY KEY (telegram_id, animal)
+        )''')
 
-    cur.execute('''CREATE TABLE IF NOT EXISTS indicacoes (
-        quem INTEGER PRIMARY KEY,
-        por  INTEGER,
-        criado_em TEXT
-    )''')
+        c.execute('''CREATE TABLE IF NOT EXISTS indicacoes (
+            quem INTEGER PRIMARY KEY,
+            por  INTEGER,
+            criado_em TEXT
+        )''')
 
-    cur.execute('''CREATE TABLE IF NOT EXISTS pagamentos (
-        invoice_id TEXT PRIMARY KEY,
-        user_id INTEGER,
-        valor_reais REAL,
-        cash INTEGER,
-        criado_em TEXT
-    )''')
-    cur.execute('''CREATE UNIQUE INDEX IF NOT EXISTS idx_pagamentos_invoice
-                   ON pagamentos(invoice_id)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS pagamentos (
+            invoice_id TEXT PRIMARY KEY,
+            user_id INTEGER,
+            valor_reais REAL,
+            cash INTEGER,
+            criado_em TEXT
+        )''')
+        c.execute('''CREATE UNIQUE INDEX IF NOT EXISTS idx_pagamentos_invoice
+                       ON pagamentos(invoice_id)''')
 
-    cur.execute('''CREATE TABLE IF NOT EXISTS saques (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        telegram_id INTEGER,
-        valor_ton REAL,
-        carteira TEXT,
-        status TEXT DEFAULT 'pendente',
-        criado_em TEXT,
-        pago_em TEXT
-    )''')
-
-    con.commit()
+        c.execute('''CREATE TABLE IF NOT EXISTS saques (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            telegram_id INTEGER,
+            valor_ton REAL,
+            carteira TEXT,
+            status TEXT DEFAULT 'pendente',
+            criado_em TEXT,
+            pago_em TEXT
+        )''')
 
 def cadastrar_animais():
-    # (preco em cash, rendimento em MATERIAIS/dia)
     animais = [
         ('Galinha', 100,    800,    '🐔'),
         ('Porco',   500,   4000,    '🐖'),
@@ -240,37 +255,34 @@ def cadastrar_animais():
         ('Cabra', 20000, 280000,    '🐐'),
         ('Cavalo',50000, 900000,    '🐎'),
     ]
-    for nome, preco, rendimento, emoji in animais:
-        cur.execute(
-            """
-            INSERT INTO animais (nome, preco, rendimento, emoji)
-            VALUES (?,?,?,?)
-            ON CONFLICT(nome) DO UPDATE SET
-                preco=excluded.preco,
-                rendimento=excluded.rendimento,
-                emoji=excluded.emoji
-            """,
-            (nome, preco, rendimento, emoji)
-        )
-    con.commit()
-
+    with db_conn() as c:
+        for nome, preco, rendimento, emoji in animais:
+            c.execute(
+                """
+                INSERT INTO animais (nome, preco, rendimento, emoji)
+                VALUES (?,?,?,?)
+                ON CONFLICT(nome) DO UPDATE SET
+                    preco=excluded.preco,
+                    rendimento=excluded.rendimento,
+                    emoji=excluded.emoji
+                """,
+                (nome, preco, rendimento, emoji)
+            )
 
 def ensure_schema():
-    conn = sqlite3.connect(DB_PATH)
-    try:
-        if not _column_exists(conn, "usuarios", "carteira_ton"):
-            conn.execute("ALTER TABLE usuarios ADD COLUMN carteira_ton TEXT")
-        if not _column_exists(conn, "usuarios", "saldo_cash"):
-            conn.execute("ALTER TABLE usuarios ADD COLUMN saldo_cash REAL DEFAULT 0.0")
-        if not _column_exists(conn, "usuarios", "saldo_cash_pagamentos"):
-            conn.execute("ALTER TABLE usuarios ADD COLUMN saldo_cash_pagamentos REAL DEFAULT 0.0")
-        if not _column_exists(conn, "usuarios", "saldo_ton"):
-            conn.execute("ALTER TABLE usuarios ADD COLUMN saldo_ton REAL DEFAULT 0.0")
-        if not _column_exists(conn, "usuarios", "saldo_materiais"):
-            conn.execute("ALTER TABLE usuarios ADD COLUMN saldo_materiais REAL DEFAULT 0.0")
+    with db_conn() as c:
+        if not _column_exists(c, "usuarios", "carteira_ton"):
+            c.execute("ALTER TABLE usuarios ADD COLUMN carteira_ton TEXT")
+        if not _column_exists(c, "usuarios", "saldo_cash"):
+            c.execute("ALTER TABLE usuarios ADD COLUMN saldo_cash REAL DEFAULT 0.0")
+        if not _column_exists(c, "usuarios", "saldo_cash_pagamentos"):
+            c.execute("ALTER TABLE usuarios ADD COLUMN saldo_cash_pagamentos REAL DEFAULT 0.0")
+        if not _column_exists(c, "usuarios", "saldo_ton"):
+            c.execute("ALTER TABLE usuarios ADD COLUMN saldo_ton REAL DEFAULT 0.0")
+        if not _column_exists(c, "usuarios", "saldo_materiais"):
+            c.execute("ALTER TABLE usuarios ADD COLUMN saldo_materiais REAL DEFAULT 0.0")
 
-        # Garantir que ultima_coleta não fique nula/vazia
-        conn.execute(
+        c.execute(
             """
             UPDATE inventario
                SET ultima_coleta = COALESCE(ultima_coleta, ?)
@@ -279,7 +291,7 @@ def ensure_schema():
             (datetime.now().isoformat(),)
         )
 
-        conn.execute("""
+        c.execute("""
         CREATE TABLE IF NOT EXISTS withdrawals (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           user_id INTEGER NOT NULL,
@@ -292,7 +304,7 @@ def ensure_schema():
         )
         """)
 
-        conn.execute("""
+        c.execute("""
         CREATE TABLE IF NOT EXISTS cb_tokens (
             id TEXT PRIMARY KEY,
             user_id INTEGER NOT NULL,
@@ -304,18 +316,10 @@ def ensure_schema():
         )
         """)
 
-        # --- Índices úteis (desempenho em contagens/consultas) ---
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_indicacoes_por ON indicacoes(por)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_inventario_uid ON inventario(telegram_id)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_pag_user ON pagamentos(user_id)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_wd_user ON withdrawals(user_id)")
-
-        conn.commit()
-    finally:
-        conn.close()
-
-
-
+        c.execute("CREATE INDEX IF NOT EXISTS idx_indicacoes_por ON indicacoes(por)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_inventario_uid ON inventario(telegram_id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_pag_user ON pagamentos(user_id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_wd_user ON withdrawals(user_id)")
 
 # cria tudo primeiro, depois prossegue
 init_db()
@@ -323,7 +327,6 @@ cadastrar_animais()
 ensure_schema()
 
 # ========= CRYPTO PAY ==========
-# use .strip() para evitar espaços/linhas acidentais no Render
 CRYPTOPAY_TOKEN = (os.getenv("CRYPTOPAY_TOKEN") or "").strip()
 CRYPTOPAY_API = "https://pay.crypt.bot/api"
 
@@ -331,11 +334,31 @@ CASH_POR_REAL = int(os.getenv("CASH_POR_REAL", "100"))
 REF_PCT = float(os.getenv("REF_PCT", "4"))
 
 # ========= BOT / APP ==========
-from aiohttp import ClientTimeout  # (usado em outros pontos)
-
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 app = FastAPI()
+
+# ===== Rate Limit Middleware =====
+class RateLimitMiddleware(BaseMiddleware):
+    def __init__(self, calls=5, per_seconds=2):
+        self.calls = calls
+        self.per = per_seconds
+        self.bucket = defaultdict(list)
+
+    async def __call__(self, handler, event, data):
+        uid = getattr(getattr(event, "from_user", None), "id", None)
+        now = time.time()
+        if uid:
+            q = self.bucket[uid]
+            while q and now - q[0] > self.per:
+                q.pop(0)
+            if len(q) >= self.calls:
+                return  # silencioso
+            q.append(now)
+        return await handler(event, data)
+
+dp.message.middleware(RateLimitMiddleware(calls=5, per_seconds=2))
+dp.callback_query.middleware(RateLimitMiddleware(calls=8, per_seconds=2))
 
 @app.get("/")
 async def root():
@@ -364,7 +387,6 @@ def cryptopay_call(method: str, payload: dict):
     return data["result"]
 
 def get_app_balances():
-    """Obtém os saldos do App (TON/USDT etc.). Útil pra depurar payout."""
     return cryptopay_call("getBalance", {})
 
 def criar_invoice_cryptopay(user_id: int, valor_reais: float) -> str:
@@ -411,7 +433,6 @@ class WalletStates(StatesGroup):
 class WithdrawStates(StatesGroup):
     waiting_amount_ton = State()
 
-    
 # === UTILS ===
 WALLET_RE = re.compile(r'^[UE]Q[A-Za-z0-9_-]{45,}$')
 
@@ -426,10 +447,6 @@ def new_idempotency_key(user_id: int) -> str:
     return f"wd-{user_id}-{int(time.time())}-{uuid.uuid4().hex[:8]}"
 
 def _balance_code(b: dict) -> str:
-    """
-    Extrai o código do ativo de um item do getBalance, mesmo que a API use
-    um nome de campo diferente. Normaliza para maiúsculas.
-    """
     return (
         (b.get("currency")
          or b.get("asset")
@@ -442,10 +459,6 @@ def _balance_code(b: dict) -> str:
     )
 
 def cb_new(user_id: int, action: str, payload: str = "", ttl: int = 600) -> str:
-    """
-    Cria um token de callback com expiração (TTL em segundos).
-    Retorna o token (8-hex).
-    """
     token = uuid.uuid4().hex[:8]
     exp = int(time.time()) + ttl
     with db_conn() as c:
@@ -457,10 +470,6 @@ def cb_new(user_id: int, action: str, payload: str = "", ttl: int = 600) -> str:
     return token
 
 def cb_check_and_use(token: str, user_id: int, action: str) -> tuple[bool, str | None, str]:
-    """
-    Valida e marca como 'usado' um token. 
-    Retorna (ok, payload, msg_erro).
-    """
     now = int(time.time())
     with db_conn() as c:
         row = c.execute(
@@ -479,8 +488,6 @@ def cb_check_and_use(token: str, user_id: int, action: str) -> tuple[bool, str |
         payload = row["payload"] if row["payload"] is not None else ""
         return True, payload, ""
 
-
-
 # ===== PRODUTIVIDADE (crescimento com o tempo) =====
 def _now():
     return datetime.now()
@@ -489,12 +496,6 @@ def _iso_now():
     return _now().isoformat()
 
 def _produzido_desde(rendimento_dia: float, quantidade: int, ultima_coleta_iso: str | None) -> float:
-    """
-    rendimento_dia: cash/dia de UM animal
-    quantidade: número de animais
-    ultima_coleta_iso: texto ISO salvo na tabela
-    retorna o quanto foi produzido (em cash) desde a ultima_coleta
-    """
     try:
         base = datetime.fromisoformat(ultima_coleta_iso) if ultima_coleta_iso else None
     except Exception:
@@ -508,10 +509,6 @@ def _produzido_desde(rendimento_dia: float, quantidade: int, ultima_coleta_iso: 
     return max(0.0, por_seg * segundos)
 
 def get_producao_usuario(uid: int):
-    """
-    Retorna (itens, total) onde itens é uma lista de dicts:
-    {animal, emoji, qtd, produzido}
-    """
     with db_conn() as c:
         rows = c.execute("""
             SELECT i.animal, i.quantidade, i.ultima_coleta, a.rendimento, a.emoji
@@ -533,13 +530,6 @@ def get_producao_usuario(uid: int):
         total += prod
     return itens, total
 
-
-
-def db_conn():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
 def set_wallet(user_id: int, wallet: str):
     ensure_user(user_id)
     with db_conn() as c:
@@ -556,8 +546,6 @@ def get_balances(user_id: int):
         if not r: return 0.0, 0.0, 0.0
         return r["saldo_cash"], r["saldo_cash_pagamentos"], r["saldo_ton"]
 
-
-# === NOVO: ler saldo de Materiais do usuário ===
 def get_user_materiais(user_id: int) -> float:
     with db_conn() as c:
         r = c.execute(
@@ -583,7 +571,8 @@ def create_withdraw(user_id: int, requested_ton: float, wallet: str, idemp: str)
     with db_conn() as c:
         c.execute("""INSERT INTO withdrawals (user_id, requested_ton, wallet, status, idempotency_key)
                      VALUES (?,?,?,?,?)""", (user_id, requested_ton, wallet, 'pending', idemp))
-        return c.execute("SELECT last_insert_rowid() id").fetchone()["id"]
+        row = c.execute("SELECT last_insert_rowid() id").fetchone()
+        return row["id"] if row else None
 
 def set_withdraw_status(wid: int, status: str):
     with db_conn() as c:
@@ -593,10 +582,6 @@ class CryptoPayError(Exception):
     pass
 
 async def cryptopay_transfer_ton_to_address(amount_ton: float, ton_address: str, idempotency_key: str):
-    """
-    Envia TON para um endereço on-chain usando createPayout.
-    Usa a helper síncrona cryptopay_call com tratamento de erro padronizado.
-    """
     payload = {
         "asset": "TON",
         "amount": f"{amount_ton:.9f}",
@@ -623,17 +608,11 @@ async def cryptopay_transfer_ton_to_user(amount_ton: float, crypto_user_id: int,
         return data["result"]
 
 def criar_check_ton(amount_ton: float) -> dict:
-    """
-    Fallback de saque: cria um Check do CryptoBot com TON.
-    Retorna o dicionário do result (contém 'check_url').
-    """
     payload = {"asset": "TON", "amount": f"{amount_ton:.9f}"}
     return cryptopay_call("createCheck", payload)
 
-
 # ===== Assinatura do webhook (oficial) =====
 def verify_cryptopay_signature(body: bytes, signature: str, token: str) -> bool:
-    # HMAC-SHA256(body, sha256(token)) — conforme docs do Crypto Pay
     secret = hashlib.sha256((token or "").encode()).digest()
     computed = hmac.new(secret, body, hashlib.sha256).hexdigest()
     return hmac.compare_digest((signature or "").lower(), computed.lower())
@@ -641,19 +620,16 @@ def verify_cryptopay_signature(body: bytes, signature: str, token: str) -> bool:
 # ========= WEBHOOK CRYPTO PAY =========
 @app.post("/webhook/cryptopay")
 async def cryptopay_webhook(request: Request):
-    # 1) pegar o header correto (com fallback em minúsculas)
     signature = (
         request.headers.get("Crypto-Pay-API-Signature")
         or request.headers.get("crypto-pay-api-signature")
         or ""
     )
-
     body = await request.body()
 
-    # 2) verifica assinatura (usa SHA256(token) como chave do HMAC)
     if not verify_cryptopay_signature(body, signature, CRYPTOPAY_TOKEN):
         logging.warning("[cryptopay] assinatura inválida")
-        return {"ok": False}
+        raise HTTPException(status_code=403, detail="invalid signature")
 
     data = await request.json()
 
@@ -689,49 +665,47 @@ async def cryptopay_webhook(request: Request):
 
     cash = int(round(reais * CASH_POR_REAL))
 
-    try:
-        cur.execute(
-            "INSERT INTO pagamentos (invoice_id, user_id, valor_reais, cash, criado_em) VALUES (?,?,?,?,?)",
-            (invoice_id, user_id, reais, cash, datetime.now().isoformat())
-        )
-        con.commit()
-    except sqlite3.IntegrityError:
-        return {"ok": True}
-
-    cur.execute(
-        "INSERT OR IGNORE INTO usuarios (telegram_id, criado_em) VALUES (?, ?)",
-        (user_id, datetime.now().isoformat())
-    )
-
-    if cash > 0:
-        cur.execute(
-            "UPDATE usuarios SET saldo_cash = COALESCE(saldo_cash,0) + ? WHERE telegram_id=?",
-            (cash, user_id)
-        )
-
-    cur.execute("SELECT por FROM indicacoes WHERE quem=?", (user_id,))
-    row = cur.fetchone()
-    if row:
-        ref_id = int(row[0])
-        bonus = int(round(cash * REF_PCT / 100.0))
-        if bonus > 0:
-            cur.execute(
-                "INSERT OR IGNORE INTO usuarios (telegram_id, criado_em) VALUES (?, ?)",
-                (ref_id, datetime.now().isoformat())
+    # grava pagamento e credita
+    with db_conn() as c:
+        try:
+            c.execute(
+                "INSERT INTO pagamentos (invoice_id, user_id, valor_reais, cash, criado_em) VALUES (?,?,?,?,?)",
+                (invoice_id, user_id, reais, cash, datetime.now().isoformat())
             )
-            cur.execute(
+        except sqlite3.IntegrityError:
+            return {"ok": True}
+
+        c.execute(
+            "INSERT OR IGNORE INTO usuarios (telegram_id, criado_em) VALUES (?, ?)",
+            (user_id, datetime.now().isoformat())
+        )
+
+        if cash > 0:
+            c.execute(
                 "UPDATE usuarios SET saldo_cash = COALESCE(saldo_cash,0) + ? WHERE telegram_id=?",
-                (bonus, ref_id)
+                (cash, user_id)
             )
-            try:
-                await bot.send_message(
-                    ref_id,
-                    f"🎁 Bônus de indicação: +{bonus} cash (amigo depositou R$ {reais:.2f})."
-                )
-            except Exception:
-                pass
 
-    con.commit()
+        row = c.execute("SELECT por FROM indicacoes WHERE quem=?", (user_id,)).fetchone()
+        if row:
+            ref_id = int(row["por"])
+            bonus = int(round(cash * REF_PCT / 100.0))
+            if bonus > 0:
+                c.execute(
+                    "INSERT OR IGNORE INTO usuarios (telegram_id, criado_em) VALUES (?, ?)",
+                    (ref_id, datetime.now().isoformat())
+                )
+                c.execute(
+                    "UPDATE usuarios SET saldo_cash = COALESCE(saldo_cash,0) + ? WHERE telegram_id=?",
+                    (bonus, ref_id)
+                )
+                try:
+                    await bot.send_message(
+                        ref_id,
+                        f"🎁 Bônus de indicação: +{bonus} cash (amigo depositou R$ {reais:.2f})."
+                    )
+                except Exception:
+                    pass
 
     if cash > 0:
         try:
@@ -762,40 +736,36 @@ def menu():
         resize_keyboard=True
     )
 
-
 # ========= HANDLERS =========
 @dp.message(Command('start'))
 async def start(msg: types.Message):
     user_id = msg.from_user.id
-    cur.execute(
-        "INSERT OR IGNORE INTO usuarios (telegram_id, criado_em) VALUES (?, ?)",
-        (user_id, datetime.now().isoformat())
-    )
-    con.commit()
+    with db_conn() as c:
+        c.execute(
+            "INSERT OR IGNORE INTO usuarios (telegram_id, criado_em) VALUES (?, ?)",
+            (user_id, datetime.now().isoformat())
+        )
 
     parts = (msg.text or "").split()
     ref_id = None
     if len(parts) >= 2 and parts[0] == '/start' and parts[1].isdigit():
         ref_id = int(parts[1])
     if ref_id and ref_id != user_id:
-        cur.execute(
-            "INSERT OR IGNORE INTO indicacoes (quem, por, criado_em) VALUES (?, ?, ?)",
-            (user_id, ref_id, datetime.now().isoformat())
-        )
-        con.commit()
+        with db_conn() as c:
+            c.execute(
+                "INSERT OR IGNORE INTO indicacoes (quem, por, criado_em) VALUES (?, ?, ?)",
+                (user_id, ref_id, datetime.now().isoformat())
+            )
 
-    # agora buscamos também o cash de pagamentos
-    cur.execute("SELECT COALESCE(saldo_cash,0), COALESCE(saldo_cash_pagamentos,0), COALESCE(saldo_ton,0) FROM usuarios WHERE telegram_id=?", (user_id,))
-    row = cur.fetchone()
-    saldo_cash, saldo_pag, saldo_ton = row if row else (0, 0, 0)
+    with db_conn() as c:
+        row = c.execute("SELECT COALESCE(saldo_cash,0), COALESCE(saldo_cash_pagamentos,0), COALESCE(saldo_ton,0) FROM usuarios WHERE telegram_id=?", (user_id,)).fetchone()
+        saldo_cash, saldo_pag, saldo_ton = (row[0], row[1], row[2]) if row else (0, 0, 0)
 
-    # rendimento/dia (em materiais)
-    cur.execute("""
-        SELECT SUM(quantidade * rendimento)
-        FROM inventario JOIN animais ON inventario.animal = animais.nome
-        WHERE inventario.telegram_id=?
-    """, (user_id,))
-    rendimento_dia = cur.fetchone()[0] or 0
+        rendimento_dia = c.execute("""
+            SELECT SUM(quantidade * rendimento)
+            FROM inventario JOIN animais ON inventario.animal = animais.nome
+            WHERE inventario.telegram_id=?
+        """, (user_id,)).fetchone()[0] or 0
 
     texto = (
         "🌾 *Bem-vindo à Fazenda TON!*\n\n"
@@ -804,27 +774,26 @@ async def start(msg: types.Message):
         f"💎 TON: *{saldo_ton:.4f}*\n\n"
         f"📈 Rendimento/dia: *{int(rendimento_dia):,}* materiais\n\n"
         "Escolha uma opção:"
-    ).replace(",", ".")  # milhar com ponto
+    ).replace(",", ".")
     await msg.answer(texto, reply_markup=menu(), parse_mode="Markdown")
-
-
 
 @dp.message(F.text == "💰 Meu Saldo")
 async def saldo(msg: types.Message):
     user_id = msg.from_user.id
-    r = cur.execute("""
-        SELECT 
-            COALESCE(saldo_cash,0)               AS cash_disp,
-            COALESCE(saldo_cash_pagamentos,0)    AS cash_pag,
-            COALESCE(saldo_ton,0)                AS saldo_ton,
-            COALESCE(saldo_materiais,0)          AS mats
-        FROM usuarios WHERE telegram_id=?
-    """, (user_id,)).fetchone() or (0,0,0,0)
+    with db_conn() as c:
+        r = c.execute("""
+            SELECT 
+                COALESCE(saldo_cash,0)               AS cash_disp,
+                COALESCE(saldo_cash_pagamentos,0)    AS cash_pag,
+                COALESCE(saldo_ton,0)                AS saldo_ton,
+                COALESCE(saldo_materiais,0)          AS mats
+            FROM usuarios WHERE telegram_id=?
+        """, (user_id,)).fetchone()
 
-    cash_disp   = r["cash_disp"] if isinstance(r, sqlite3.Row) else r[0]
-    cash_pag    = r["cash_pag"]  if isinstance(r, sqlite3.Row) else r[1]
-    saldo_ton   = r["saldo_ton"] if isinstance(r, sqlite3.Row) else r[2]
-    materiais   = r["mats"]      if isinstance(r, sqlite3.Row) else r[3]
+    cash_disp   = r["cash_disp"] if r else 0
+    cash_pag    = r["cash_pag"]  if r else 0
+    saldo_ton   = r["saldo_ton"] if r else 0
+    materiais   = r["mats"]      if r else 0
 
     texto = (
         "📊 *Seus saldos*\n\n"
@@ -837,22 +806,18 @@ async def saldo(msg: types.Message):
     )
     await msg.answer(texto, parse_mode="Markdown")
 
-
-
-
 @dp.message(F.text == "🛒 Comprar")
 async def comprar(msg: types.Message):
     await msg.answer("Escolha um animal para comprar:", reply_markup=kb_voltar())
-    cur.execute("SELECT nome, preco, rendimento, emoji FROM animais ORDER BY preco ASC")
-    for nome, preco, rendimento, emoji in cur.fetchall():
+    with db_conn() as c:
+        rows = c.execute("SELECT nome, preco, rendimento, emoji FROM animais ORDER BY preco ASC").fetchall()
+    for nome, preco, rendimento, emoji in [(r["nome"], r["preco"], r["rendimento"], r["emoji"]) for r in rows]:
         card = (
             f"{emoji} *{nome}*\n"
             f"📈 Rende: *{int(rendimento):,}* Materiais/dia\n"
             f"💵 Preço: *{preco}* cash"
-        ).replace(",", ".")  # troca separador milhar para ponto
-        kb_inline = types.InlineKeyboardMarkup(inline_keyboard=[[
-            types.InlineKeyboardButton(text=f"Comprar {emoji}", callback_data=f"buy:{nome}")
-        ]])
+        ).replace(",", ".")
+        kb_inline = types.InlineKeyboardMarkup(inline_keyboard=[[types.InlineKeyboardButton(text=f"Comprar {emoji}", callback_data=f"buy:{nome}")]])
         await msg.answer(card, reply_markup=kb_inline, parse_mode="Markdown")
 
 @dp.callback_query(F.data.startswith("buy:"))
@@ -860,33 +825,31 @@ async def comprar_animal_cb(call: types.CallbackQuery):
     nome = call.data.split("buy:", 1)[1]
     user_id = call.from_user.id
 
-    cur.execute("SELECT preco, rendimento, emoji FROM animais WHERE nome=?", (nome,))
-    r = cur.fetchone()
-    if not r:
-        await call.answer("Animal não encontrado.", show_alert=True)
-        return
-    preco, rendimento, emoji = r
+    with db_conn() as c:
+        r = c.execute("SELECT preco, rendimento, emoji FROM animais WHERE nome=?", (nome,)).fetchone()
+        if not r:
+            await call.answer("Animal não encontrado.", show_alert=True)
+            return
+        preco, rendimento, emoji = r["preco"], r["rendimento"], r["emoji"]
 
-    cur.execute("SELECT saldo_cash FROM usuarios WHERE telegram_id=?", (user_id,))
-    row = cur.fetchone()
-    saldo = row[0] if row else 0
+        row = c.execute("SELECT saldo_cash FROM usuarios WHERE telegram_id=?", (user_id,)).fetchone()
+        saldo = row["saldo_cash"] if row else 0
 
-    if saldo < preco:
-        await call.message.answer(f"⚠️ Cash insuficientes para comprar {emoji}!")
-        await call.answer("Saldo insuficiente", show_alert=False)
-        return
+        if saldo < preco:
+            await call.message.answer(f"⚠️ Cash insuficientes para comprar {emoji}!")
+            await call.answer("Saldo insuficiente", show_alert=False)
+            return
 
-    cur.execute("UPDATE usuarios SET saldo_cash=saldo_cash-? WHERE telegram_id=?", (preco, user_id))
-    agora = datetime.now().isoformat()
-    cur.execute(
-        "INSERT OR IGNORE INTO inventario (telegram_id, animal, quantidade, ultima_coleta) VALUES (?, ?, 0, ?)",
-        (user_id, nome, agora)
-    )
-    cur.execute(
-        "UPDATE inventario SET quantidade=quantidade+1, ultima_coleta=? WHERE telegram_id=? AND animal=?",
-        (agora, user_id, nome)
-    )
-    con.commit()
+        c.execute("UPDATE usuarios SET saldo_cash=saldo_cash-? WHERE telegram_id=?", (preco, user_id))
+        agora = datetime.now().isoformat()
+        c.execute(
+            "INSERT OR IGNORE INTO inventario (telegram_id, animal, quantidade, ultima_coleta) VALUES (?, ?, 0, ?)",
+            (user_id, nome, agora)
+        )
+        c.execute(
+            "UPDATE inventario SET quantidade=quantidade+1, ultima_coleta=? WHERE telegram_id=? AND animal=?",
+            (agora, user_id, nome)
+        )
 
     await call.message.answer(f"✅ Você comprou com sucesso {emoji}!")
     await call.answer()
@@ -898,7 +861,6 @@ async def voltar(msg: types.Message):
 @dp.message(F.text == "🐾 Meus Animais")
 async def meus_animais(msg: types.Message):
     user_id = msg.from_user.id
-
     with db_conn() as c:
         c.execute("""
             UPDATE inventario
@@ -907,7 +869,6 @@ async def meus_animais(msg: types.Message):
         """, (_iso_now(), user_id))
 
     itens, total = get_producao_usuario(user_id)
-
     if not itens:
         return await msg.answer("Você ainda não possui animais. Compre um na loja!")
 
@@ -916,26 +877,18 @@ async def meus_animais(msg: types.Message):
         "Não deixe de colher regularmente!\n"
     ]
     for it in itens:
-        linhas.append(
-            f"{it['emoji']} {it['animal']} (*{it['qtd']}*):  *{it['produzido']:.0f}* 🧱"
-        )
+        linhas.append(f"{it['emoji']} {it['animal']} (*{it['qtd']}*):  *{it['produzido']:.0f}* 🧱")
     linhas.append(f"\n📈 *Total Produzido:* *{total:.0f}* 🧱")
 
-    # botão com token (ex.: expira em 30 segundos = 30s)
     tok = cb_new(user_id, action="collect", payload="all", ttl=30)
-    kb = types.InlineKeyboardMarkup(inline_keyboard=[[
-        types.InlineKeyboardButton(text="📥 Coletar rendimento", callback_data=f"collect:{tok}")
-    ]])
+    kb = types.InlineKeyboardMarkup(inline_keyboard=[[types.InlineKeyboardButton(text="📥 Coletar rendimento", callback_data=f"collect:{tok}")]])
 
     await msg.answer("\n".join(linhas).replace(",", "."), parse_mode="Markdown", reply_markup=kb)
-
-
 
 @dp.callback_query(F.data.startswith("collect:"))
 async def coletar_rendimento_cb(call: types.CallbackQuery):
     user_id = call.from_user.id
 
-    # valida token
     try:
         _, token = call.data.split(":", 1)
     except Exception:
@@ -945,7 +898,6 @@ async def coletar_rendimento_cb(call: types.CallbackQuery):
     if not ok:
         return await call.answer(err, show_alert=True)
 
-    # 👉 calcular produção atual
     itens, total = get_producao_usuario(user_id)
     total = float(f"{total:.6f}")
     if total <= 0.01:
@@ -971,8 +923,6 @@ async def coletar_rendimento_cb(call: types.CallbackQuery):
         parse_mode="Markdown"
     )
     await call.answer()
-
-
 
 # ===== Depósito via Crypto Pay (BRL) =====
 @dp.message(StateFilter(None), F.text == "➕ Depositar")
@@ -1035,11 +985,10 @@ async def gerar_link_custom(msg: types.Message):
     )
 
 # ===== Troca cash -> TON =====
-
 @dp.message(F.text == "🔄 Trocas")
 async def trocas_menu(msg: types.Message):
     user_id = msg.from_user.id
-    total_mats = int(get_user_materiais(user_id))  # sem separador de milhar
+    total_mats = int(get_user_materiais(user_id))
 
     texto = (
         "Você pode vender sua produção de Materiais e receber 🧾 *Cash de Pagamento*,\n"
@@ -1062,8 +1011,6 @@ async def trocas_menu(msg: types.Message):
 @dp.callback_query(F.data.startswith("materials:"))
 async def converter_materiais_cb(call: types.CallbackQuery):
     user_id = call.from_user.id
-
-    # valida token
     try:
         _, token = call.data.split(":", 1)
     except Exception:
@@ -1073,12 +1020,10 @@ async def converter_materiais_cb(call: types.CallbackQuery):
     if not ok:
         return await call.answer(err, show_alert=True)
 
-    # 👉 obter materiais atuais
     mats = get_user_materiais(user_id)
     if mats < MATERIAIS_MIN_VENDA:
         return await call.answer("Você precisa de pelo menos 2000 Materiais para converter.", show_alert=True)
 
-    # cálculo
     unidades = int(mats // MATERIAIS_DIVISOR)
     usado = int(unidades * MATERIAIS_DIVISOR)
     sobra = mats - usado
@@ -1096,7 +1041,6 @@ async def converter_materiais_cb(call: types.CallbackQuery):
 
     texto = (
         "✅ Venda de materiais bem sucedida!\n\n"
-        
         f"   ├─ ✅ Cash de Pagamentos: +{to_pag}\n"
         f"   └─ ✅ Cash Disponível: +{to_cash}\n"
         f"• Materiais restantes: {int(sobra)}"
@@ -1104,16 +1048,14 @@ async def converter_materiais_cb(call: types.CallbackQuery):
     await call.message.answer(texto)
     await call.answer()
 
-
-
-
 @dp.callback_query(F.data == "ton:swap_menu")
 async def abrir_swap_ton_cb(call: types.CallbackQuery):
     user_id = call.from_user.id
-    row = cur.execute(
-        "SELECT COALESCE(saldo_cash_pagamentos,0) FROM usuarios WHERE telegram_id=?",
-        (user_id,)
-    ).fetchone()
+    with db_conn() as c:
+        row = c.execute(
+            "SELECT COALESCE(saldo_cash_pagamentos,0) FROM usuarios WHERE telegram_id=?",
+            (user_id,)
+        ).fetchone()
     saldo_pag = row[0] if row else 0
 
     preco_brl = get_ton_price_brl()
@@ -1127,7 +1069,6 @@ async def abrir_swap_ton_cb(call: types.CallbackQuery):
         "Escolha um valor (mín. `20` cash) ou digite, exemplo: `trocar 250`"
     )
 
-    # 🔒 gera token com validade (TTL) para cada botão
     tok20  = cb_new(user_id, action="swap", payload="20",  ttl=30)
     tok50  = cb_new(user_id, action="swap", payload="50",  ttl=30)
     tok100 = cb_new(user_id, action="swap", payload="100", ttl=30)
@@ -1148,16 +1089,14 @@ async def abrir_swap_ton_cb(call: types.CallbackQuery):
     await call.message.answer(texto, parse_mode="Markdown", reply_markup=kb)
     await call.answer()
 
-
-
-
 @dp.message(F.text == "🔄 Trocar cash por TON")
 async def trocar_cash(msg: types.Message):
     user_id = msg.from_user.id
-    row = cur.execute(
-        "SELECT COALESCE(saldo_cash_pagamentos,0) FROM usuarios WHERE telegram_id=?",
-        (user_id,)
-    ).fetchone()
+    with db_conn() as c:
+        row = c.execute(
+            "SELECT COALESCE(saldo_cash_pagamentos,0) FROM usuarios WHERE telegram_id=?",
+            (user_id,)
+        ).fetchone()
     saldo_pag = row[0] if row else 0
 
     preco_brl = get_ton_price_brl()
@@ -1190,65 +1129,53 @@ async def trocar_cash(msg: types.Message):
     ])
     await msg.answer(texto, parse_mode="Markdown", reply_markup=kb)
 
-
 @dp.callback_query(F.data.startswith("swap:"))
 async def swap_cb(call: types.CallbackQuery):
     user_id = call.from_user.id
-
-    # Esperamos "swap:<amount>:<token>"
     try:
         _, amount_s, token = call.data.split(":", 2)
     except Exception:
         return await call.answer("Essa interação expirou. Por favor, tente novamente.", show_alert=True)
 
-    # 🔒 valida o token (expirado/uso único/pertence ao usuário/ação correta)
     ok, payload, err = cb_check_and_use(token, user_id, action="swap")
     if not ok:
         return await call.answer(err, show_alert=True)
-
-    # Segurança extra: confere se o amount do botão bate com o payload gravado
     if (payload or "") != amount_s:
         return await call.answer("Essa interação não é mais válida. Por favor, tente novamente.", show_alert=True)
 
-    # ----------- (se passou, segue seu fluxo atual) -----------
-    row = cur.execute(
-        "SELECT COALESCE(saldo_cash_pagamentos,0), COALESCE(saldo_ton,0) FROM usuarios WHERE telegram_id=?",
-        (user_id,)
-    ).fetchone()
-    saldo_pag, saldo_ton = row if row else (0, 0)
+    with db_conn() as c:
+        row = c.execute(
+            "SELECT COALESCE(saldo_cash_pagamentos,0), COALESCE(saldo_ton,0) FROM usuarios WHERE telegram_id=?",
+            (user_id,)
+        ).fetchone()
+        saldo_pag, saldo_ton = (row[0], row[1]) if row else (0, 0)
 
     preco_brl = get_ton_price_brl()
     cash_por_ton = max(1, int(round(preco_brl * CASH_POR_REAL)))
 
     amount = saldo_pag if amount_s == "all" else int(amount_s)
-
     if amount < 20:
         return await call.answer("Mínimo 20 cash.", show_alert=True)
     if amount > saldo_pag:
         return await call.answer("Saldo de pagamentos insuficiente.", show_alert=True)
 
     ton_out = amount / cash_por_ton
-    cur.execute(
-        "UPDATE usuarios SET saldo_cash_pagamentos=saldo_cash_pagamentos-?, saldo_ton=saldo_ton+? WHERE telegram_id=?",
-        (amount, ton_out, user_id)
-    )
-    
-    con.commit()
-
-    # lê o novo saldo TON do usuário
-    row_new = cur.execute(
-        "SELECT COALESCE(saldo_ton,0) FROM usuarios WHERE telegram_id=?",
-        (user_id,)
-    ).fetchone()
-    novo_saldo_ton = row_new[0] if row_new else 0.0
+    with db_conn() as c:
+        c.execute(
+            "UPDATE usuarios SET saldo_cash_pagamentos=saldo_cash_pagamentos-?, saldo_ton=saldo_ton+? WHERE telegram_id=?",
+            (amount, ton_out, user_id)
+        )
+        row_new = c.execute(
+            "SELECT COALESCE(saldo_ton,0) AS s FROM usuarios WHERE telegram_id=?",
+            (user_id,)
+        ).fetchone()
+        novo_saldo_ton = row_new["s"] if row_new else 0.0
 
     await call.message.answer(
         f"✅ Convertidos `{amount}` cash de pagamentos → `+{ton_out:.5f}` TON\n"
         f"💎 Novo saldo TON: `{novo_saldo_ton:.5f}`",
         parse_mode="Markdown"
     )
-
-
 
 @dp.message(lambda m: m.text and m.text.lower().startswith("trocar "))
 async def trocar_texto(msg: types.Message):
@@ -1260,11 +1187,12 @@ async def trocar_texto(msg: types.Message):
         return
 
     user_id = msg.from_user.id
-    row = cur.execute(
-        "SELECT COALESCE(saldo_cash_pagamentos,0), COALESCE(saldo_ton,0) FROM usuarios WHERE telegram_id=?",
-        (user_id,)
-    ).fetchone()
-    saldo_pag, saldo_ton = row if row else (0, 0)
+    with db_conn() as c:
+        row = c.execute(
+            "SELECT COALESCE(saldo_cash_pagamentos,0), COALESCE(saldo_ton,0) FROM usuarios WHERE telegram_id=?",
+            (user_id,)
+        ).fetchone()
+        saldo_pag, saldo_ton = (row[0], row[1]) if row else (0, 0)
 
     if amount < 20:
         await msg.answer("Mínimo 20 cash.")
@@ -1277,25 +1205,22 @@ async def trocar_texto(msg: types.Message):
     cash_por_ton = max(1, int(round(preco_brl * CASH_POR_REAL)))
     ton_out = amount / cash_por_ton
 
-    cur.execute(
-        "UPDATE usuarios SET saldo_cash_pagamentos=saldo_cash_pagamentos-?, saldo_ton=saldo_ton+? WHERE telegram_id=?",
-        (amount, ton_out, user_id)
-    )
-    con.commit()
-
-    # lê o novo saldo TON do usuário
-    row_new = cur.execute(
-        "SELECT COALESCE(saldo_ton,0) FROM usuarios WHERE telegram_id=?",
-        (user_id,)
-    ).fetchone()
-    novo_saldo_ton = row_new[0] if row_new else 0.0
+    with db_conn() as c:
+        c.execute(
+            "UPDATE usuarios SET saldo_cash_pagamentos=saldo_cash_pagamentos-?, saldo_ton=saldo_ton+? WHERE telegram_id=?",
+            (amount, ton_out, user_id)
+        )
+        row_new = c.execute(
+            "SELECT COALESCE(saldo_ton,0) AS s FROM usuarios WHERE telegram_id=?",
+            (user_id,)
+        ).fetchone()
+        novo_saldo_ton = row_new["s"] if row_new else 0.0
 
     await msg.answer(
         f"✅ Convertidos `{amount}` cash de pagamentos → `+{ton_out:.5f}` TON\n"
         f"💎 Novo saldo TON: `{novo_saldo_ton:.5f}`",
         parse_mode="Markdown"
     )
-
 
 # ===== Saque =====
 @dp.message(F.text == "🏦 Sacar")
@@ -1391,7 +1316,6 @@ async def iniciar_pagamento(msg: types.Message, state: FSMContext):
 
 @dp.message(StateFilter(WithdrawStates.waiting_amount_ton))
 async def processar_saque(msg: types.Message, state: FSMContext):
-    # 0) Parse do valor
     try:
         amount_ton = float((msg.text or "").replace(",", "."))
         if amount_ton <= 0:
@@ -1412,7 +1336,18 @@ async def processar_saque(msg: types.Message, state: FSMContext):
             reply_markup=sacar_keyboard()
         )
 
-    # 1) Checar saldo do USUÁRIO ANTES de olhar o cofre (não tenta processar se não houver saldo)
+    # 1) Bloqueio: não permitir múltiplos saques simultâneos
+    with db_conn() as c:
+        r = c.execute(
+            "SELECT COUNT(*) AS n FROM withdrawals WHERE user_id=? AND status IN ('pending','processing')",
+            (user_id,)
+        ).fetchone()
+        n_locked = (r["n"] if isinstance(r, sqlite3.Row) else r[0]) if r else 0
+        if n_locked > 0:
+            await state.set_state(WithdrawStates.waiting_amount_ton)
+            return await msg.answer("Você já tem um saque em processamento. Aguarde finalizar.")
+
+    # 2) Checar saldo do USUÁRIO antes de cofre (mesmo feedback já existe)
     with db_conn() as c:
         row = c.execute("SELECT saldo_ton FROM usuarios WHERE telegram_id=?", (user_id,)).fetchone()
         saldo_ton = row["saldo_ton"] if row else 0.0
@@ -1424,8 +1359,7 @@ async def processar_saque(msg: types.Message, state: FSMContext):
                 reply_markup=sacar_keyboard()
             )
 
-
-    # 2) Checar cofre do App (sem revelar números ao usuário)
+    # 3) Checar cofre do App (sem revelar números ao usuário)
     try:
         balances = get_app_balances()
         ton_avail = 0.0
@@ -1434,7 +1368,6 @@ async def processar_saque(msg: types.Message, state: FSMContext):
             if code == "TON":
                 ton_avail = float(b.get("available") or 0)
                 break
-
         if ton_avail + 1e-9 < amount_ton:
             await state.set_state(WithdrawStates.waiting_amount_ton)
             return await msg.answer(
@@ -1442,13 +1375,22 @@ async def processar_saque(msg: types.Message, state: FSMContext):
                 "Digite outro valor ou toque em ⬅️ Voltar.",
                 reply_markup=sacar_keyboard()
             )
-
     except Exception as e:
         logging.warning(f"[payout] get_app_balances falhou: {e}")
 
-    # 3) Reservar saldo do usuário AGORA (só depois das checagens acima)
+    # 4) Reservar saldo do usuário ATOMICAMENTE (sem corrida)
     with db_conn() as c:
-        c.execute("UPDATE usuarios SET saldo_ton = saldo_ton - ? WHERE telegram_id=?", (amount_ton, user_id))
+        cur2 = c.execute(
+            "UPDATE usuarios SET saldo_ton = saldo_ton - ? WHERE telegram_id=? AND saldo_ton >= ?",
+            (amount_ton, user_id, amount_ton)
+        )
+        if cur2.rowcount != 1:
+            await state.set_state(WithdrawStates.waiting_amount_ton)
+            return await msg.answer(
+                "Você não possui TON suficiente para este saque. "
+                "Digite outro valor ou toque em ⬅️ Voltar.",
+                reply_markup=sacar_keyboard()
+            )
 
     idemp = new_idempotency_key(user_id)
     wid = create_withdraw(user_id, requested_ton=amount_ton, wallet=wallet, idemp=idemp)
@@ -1456,7 +1398,7 @@ async def processar_saque(msg: types.Message, state: FSMContext):
     await msg.answer("⏳ Processando seu saque…")
 
     try:
-        # 4) Payout direto
+        # 5) Payout direto
         await cryptopay_transfer_ton_to_address(amount_ton, wallet, idemp)
         set_withdraw_status(wid, "done")
         await msg.answer(
@@ -1466,7 +1408,7 @@ async def processar_saque(msg: types.Message, state: FSMContext):
 
     except CryptoPayError as e:
         err = str(e)
-        # 5) Fallback para Check, caso payouts estejam desabilitados
+        # 6) Fallback para Check
         if "METHOD_NOT_FOUND" in err or "createPayout" in err or "METHOD_DISABLED" in err:
             try:
                 chk = criar_check_ton(amount_ton)
@@ -1480,7 +1422,7 @@ async def processar_saque(msg: types.Message, state: FSMContext):
                 )
 
                 if not link:
-                    # estorna, pois não conseguimos entregar o link
+                    # estorna
                     with db_conn() as c:
                         c.execute(
                             "UPDATE usuarios SET saldo_ton = saldo_ton + ? WHERE telegram_id=?",
@@ -1527,13 +1469,12 @@ async def processar_saque(msg: types.Message, state: FSMContext):
     finally:
         await state.clear()
 
-
-
 @dp.message(F.text == "👫 Indique & Ganhe")
 async def indicacao(msg: types.Message):
     user_id = msg.from_user.id
-    row = cur.execute("SELECT COUNT(*) FROM indicacoes WHERE por=?", (user_id,)).fetchone()
-    total_refs = row[0] if row else 0
+    with db_conn() as c:
+        row = c.execute("SELECT COUNT(*) AS n FROM indicacoes WHERE por=?", (user_id,)).fetchone()
+        total_refs = row["n"] if row else 0
     link = f"https://t.me/{BOT_USERNAME}?start={user_id}"
     texto = (
         "🎁 <b>Indique & Ganhe</b>\n\n"
@@ -1554,42 +1495,44 @@ async def ajuda(msg: types.Message):
         "Qualquer dúvida, fale conosco!"
     )
 
-
 # ===== COMANDOS DE ADMIN =====
 @dp.message(Command("users"))
 async def users_count(msg: types.Message):
-    if not is_admin(msg.from_user.id):
+    if not (is_admin(msg.from_user.id) and is_private_chat(msg)):
         return
-    row = cur.execute("SELECT COUNT(*) FROM usuarios").fetchone()
-    total = row[0] if row else 0
+    with db_conn() as c:
+        row = c.execute("SELECT COUNT(*) AS n FROM usuarios").fetchone()
+        total = row["n"] if row else 0
     await msg.answer(f"👥 Total de usuários cadastrados: {total}")
 
 @dp.message(Command("users30"))
 async def users_last_30_days(msg: types.Message):
-    if not is_admin(msg.from_user.id):
+    if not (is_admin(msg.from_user.id) and is_private_chat(msg)):
         return
     since = (datetime.now() - timedelta(days=30)).isoformat()
-    row = cur.execute("SELECT COUNT(*) FROM usuarios WHERE criado_em >= ?", (since,)).fetchone()
-    total = row[0] if row else 0
+    with db_conn() as c:
+        row = c.execute("SELECT COUNT(*) AS n FROM usuarios WHERE criado_em >= ?", (since,)).fetchone()
+        total = row["n"] if row else 0
     await msg.answer(f"📈 Novos usuários nos últimos 30 dias: {total}")
 
 @dp.message(Command("payers"))
 async def payer_count(msg: types.Message):
-    if not is_admin(msg.from_user.id):
+    if not (is_admin(msg.from_user.id) and is_private_chat(msg)):
         return
-    row = cur.execute("SELECT COUNT(DISTINCT user_id) FROM pagamentos").fetchone()
-    total = row[0] if row else 0
+    with db_conn() as c:
+        row = c.execute("SELECT COUNT(DISTINCT user_id) AS n FROM pagamentos").fetchone()
+        total = row["n"] if row else 0
     await msg.answer(f"💳 Usuários que já depositaram pelo menos uma vez: {total}")
 
-# (opcional) tudo junto num comando só:
 @dp.message(Command("stats"))
 async def stats(msg: types.Message):
-    if not is_admin(msg.from_user.id):
+    if not (is_admin(msg.from_user.id) and is_private_chat(msg)):
         return
-    users = cur.execute("SELECT COUNT(*) FROM usuarios").fetchone()[0]
     since = (datetime.now() - timedelta(days=30)).isoformat()
-    users30 = cur.execute("SELECT COUNT(*) FROM usuarios WHERE criado_em >= ?", (since,)).fetchone()[0]
-    payers = cur.execute("SELECT COUNT(DISTINCT user_id) FROM pagamentos").fetchone()[0]
+    with db_conn() as c:
+        users = c.execute("SELECT COUNT(*) AS n FROM usuarios").fetchone()["n"]
+        users30 = c.execute("SELECT COUNT(*) AS n FROM usuarios WHERE criado_em >= ?", (since,)).fetchone()["n"]
+        payers = c.execute("SELECT COUNT(DISTINCT user_id) AS n FROM pagamentos").fetchone()["n"]
     await msg.answer(
         "📊 *Estatísticas*\n"
         f"• 👥 Usuários: *{users}*\n"
@@ -1598,14 +1541,13 @@ async def stats(msg: types.Message):
         parse_mode="Markdown"
     )
 
-
 @dp.message(Command("whoami"))
 async def whoami(msg: types.Message):
     await msg.answer(f"Seu ID: {msg.from_user.id}")
 
 @dp.message(Command("id"))
 async def get_replied_id(msg: types.Message):
-    if not is_admin(msg.from_user.id):
+    if not (is_admin(msg.from_user.id) and is_private_chat(msg)):
         return
     if not msg.reply_to_message:
         return await msg.answer("Responda a uma mensagem da pessoa e envie /id.")
@@ -1615,164 +1557,167 @@ async def get_replied_id(msg: types.Message):
 
 @dp.message(Command("addcash"))
 async def add_cash(msg: types.Message):
-    if not is_admin(msg.from_user.id):
+    if not (is_admin(msg.from_user.id) and is_private_chat(msg)):
         return
     try:
         _, uid, valor = msg.text.split()
         uid = int(uid)
         valor = int(valor)
+        if abs(valor) > 10_000_000:
+            return await msg.answer("Valor fora do limite.")
     except:
         return await msg.answer("Uso: /addcash <user_id> <valor>")
-    cur.execute("UPDATE usuarios SET saldo_cash=COALESCE(saldo_cash,0)+? WHERE telegram_id=?", (valor, uid))
-    con.commit()
+    with db_conn() as c:
+        c.execute("UPDATE usuarios SET saldo_cash=COALESCE(saldo_cash,0)+? WHERE telegram_id=?", (valor, uid))
     await msg.answer(f"✅ Adicionado {valor} cash ao usuário {uid}")
 
 @dp.message(Command("addpag"))
 async def add_pag(msg: types.Message):
-    if not is_admin(msg.from_user.id):
+    if not (is_admin(msg.from_user.id) and is_private_chat(msg)):
         return
     try:
         _, uid, valor = msg.text.split()
         uid = int(uid)
         valor = int(valor)
+        if abs(valor) > 10_000_000:
+            return await msg.answer("Valor fora do limite.")
     except:
         return await msg.answer("Uso: /addpag <user_id> <valor>")
-    cur.execute("UPDATE usuarios SET saldo_cash_pagamentos=COALESCE(saldo_cash_pagamentos,0)+? WHERE telegram_id=?", (valor, uid))
-    con.commit()
+    with db_conn() as c:
+        c.execute("UPDATE usuarios SET saldo_cash_pagamentos=COALESCE(saldo_cash_pagamentos,0)+? WHERE telegram_id=?", (valor, uid))
     await msg.answer(f"✅ Adicionado {valor} cash_pagamentos ao usuário {uid}")
 
 @dp.message(Command("addton"))
 async def add_ton(msg: types.Message):
-    if not is_admin(msg.from_user.id):
+    if not (is_admin(msg.from_user.id) and is_private_chat(msg)):
         return
     try:
         _, uid, valor = msg.text.split()
         uid = int(uid)
         valor = float(valor)
+        if abs(valor) > 1_000_000:
+            return await msg.answer("Valor fora do limite.")
     except:
         return await msg.answer("Uso: /addton <user_id> <valor>")
-    cur.execute("UPDATE usuarios SET saldo_ton=COALESCE(saldo_ton,0)+? WHERE telegram_id=?", (valor, uid))
-    con.commit()
+    with db_conn() as c:
+        c.execute("UPDATE usuarios SET saldo_ton=COALESCE(saldo_ton,0)+? WHERE telegram_id=?", (valor, uid))
     await msg.answer(f"✅ Adicionado {valor} TON ao usuário {uid}")
 
 @dp.message(Command("setcash"))
 async def set_cash(msg: types.Message):
-    if not is_admin(msg.from_user.id):
+    if not (is_admin(msg.from_user.id) and is_private_chat(msg)):
         return
     try:
         _, uid, valor = msg.text.split()
         uid = int(uid); valor = float(valor)
+        if abs(valor) > 10_000_000:
+            return await msg.answer("Valor fora do limite.")
     except:
         return await msg.answer("Uso: /setcash <user_id> <valor>")
-    cur.execute("UPDATE usuarios SET saldo_cash=? WHERE telegram_id=?", (valor, uid))
-    con.commit()
+    with db_conn() as c:
+        c.execute("UPDATE usuarios SET saldo_cash=? WHERE telegram_id=?", (valor, uid))
     await msg.answer(f"✅ saldo_cash definido para {valor:.0f} (uid {uid})")
 
 @dp.message(Command("setpag"))
 async def set_pag(msg: types.Message):
-    if not is_admin(msg.from_user.id):
+    if not (is_admin(msg.from_user.id) and is_private_chat(msg)):
         return
     try:
         _, uid, valor = msg.text.split()
         uid = int(uid); valor = float(valor)
+        if abs(valor) > 10_000_000:
+            return await msg.answer("Valor fora do limite.")
     except:
         return await msg.answer("Uso: /setpag <user_id> <valor>")
-    cur.execute("UPDATE usuarios SET saldo_cash_pagamentos=? WHERE telegram_id=?", (valor, uid))
-    con.commit()
+    with db_conn() as c:
+        c.execute("UPDATE usuarios SET saldo_cash_pagamentos=? WHERE telegram_id=?", (valor, uid))
     await msg.answer(f"✅ saldo_cash_pagamentos definido para {valor:.0f} (uid {uid})")
 
 @dp.message(Command("setton"))
 async def set_ton(msg: types.Message):
-    if not is_admin(msg.from_user.id):
+    if not (is_admin(msg.from_user.id) and is_private_chat(msg)):
         return
     try:
         _, uid, valor = msg.text.split()
         uid = int(uid); valor = float(valor)
+        if abs(valor) > 1_000_000:
+            return await msg.answer("Valor fora do limite.")
     except:
         return await msg.answer("Uso: /setton <user_id> <valor>")
-    cur.execute("UPDATE usuarios SET saldo_ton=? WHERE telegram_id=?", (valor, uid))
-    con.commit()
+    with db_conn() as c:
+        c.execute("UPDATE usuarios SET saldo_ton=? WHERE telegram_id=?", (valor, uid))
     await msg.answer(f"✅ saldo_ton definido para {valor:.6f} (uid {uid})")
 
 @dp.message(Command("setmats"))
 async def set_mats(msg: types.Message):
-    if not is_admin(msg.from_user.id):
+    if not (is_admin(msg.from_user.id) and is_private_chat(msg)):
         return
     try:
         _, uid, valor = msg.text.split()
         uid = int(uid); valor = float(valor)
+        if abs(valor) > 10_000_000:
+            return await msg.answer("Valor fora do limite.")
     except:
         return await msg.answer("Uso: /setmats <user_id> <valor>")
-    cur.execute("UPDATE usuarios SET saldo_materiais=? WHERE telegram_id=?", (valor, uid))
-    con.commit()
+    with db_conn() as c:
+        c.execute("UPDATE usuarios SET saldo_materiais=? WHERE telegram_id=?", (valor, uid))
     await msg.answer(f"✅ saldo_materiais definido para {valor:.0f} (uid {uid})")
 
 @dp.message(Command("resetsaldos"))
 async def reset_saldos(msg: types.Message):
-    if not is_admin(msg.from_user.id):
+    if not (is_admin(msg.from_user.id) and is_private_chat(msg)):
         return
     try:
         _, uid = msg.text.split()
         uid = int(uid)
     except:
         return await msg.answer("Uso: /resetsaldos <user_id>")
-    cur.execute("""
-        UPDATE usuarios SET
-            saldo_cash=0,
-            saldo_cash_pagamentos=0,
-            saldo_ton=0,
-            saldo_materiais=0
-        WHERE telegram_id=?
-    """, (uid,))
-    con.commit()
+    with db_conn() as c:
+        c.execute("""
+            UPDATE usuarios SET
+                saldo_cash=0,
+                saldo_cash_pagamentos=0,
+                saldo_ton=0,
+                saldo_materiais=0
+            WHERE telegram_id=?
+        """, (uid,))
     await msg.answer(f"✅ Saldos zerados (uid {uid}).")
 
 @dp.message(Command("resetuser"))
 async def reset_user(msg: types.Message):
-    if not is_admin(msg.from_user.id):
+    if not (is_admin(msg.from_user.id) and is_private_chat(msg)):
         return
     parts = (msg.text or "").split()
     if len(parts) < 2:
         return await msg.answer("Uso: /resetuser <user_id> [soft|hard]")
     uid = int(parts[1])
     mode = parts[2].lower() if len(parts) >= 3 else "soft"
-
     if mode not in {"soft","hard"}:
         return await msg.answer("Modo inválido. Use: soft ou hard.")
 
-    # SOFT: zera saldos e limpa inventário
-    cur.execute("""
-        UPDATE usuarios SET
-            saldo_cash=0,
-            saldo_cash_pagamentos=0,
-            saldo_ton=0,
-            saldo_materiais=0
-        WHERE telegram_id=?
-    """, (uid,))
-    cur.execute("DELETE FROM inventario WHERE telegram_id=?", (uid,))
-    # (opcional) remover a carteira para o usuário reconfigurar:
-    # cur.execute("UPDATE usuarios SET carteira_ton=NULL WHERE telegram_id=?", (uid,))
-    con.commit()
+    with db_conn() as c:
+        c.execute("""
+            UPDATE usuarios SET
+                saldo_cash=0,
+                saldo_cash_pagamentos=0,
+                saldo_ton=0,
+                saldo_materiais=0
+            WHERE telegram_id=?
+        """, (uid,))
+        c.execute("DELETE FROM inventario WHERE telegram_id=?", (uid,))
+        if mode == "soft":
+            return await msg.answer(f"✅ Reset SOFT aplicado ao uid {uid} (saldos zerados e inventário limpo).")
 
-    if mode == "soft":
-        return await msg.answer(f"✅ Reset SOFT aplicado ao uid {uid} (saldos zerados e inventário limpo).")
-
-    # HARD: apaga tudo relacionado ao usuário
-    cur.execute("DELETE FROM saques WHERE telegram_id=?", (uid,))
-    cur.execute("DELETE FROM withdrawals WHERE user_id=?", (uid,))
-    # Se quiser manter histórico financeiro, comente as duas linhas abaixo:
-    cur.execute("DELETE FROM pagamentos WHERE user_id=?", (uid,))
-    # Remove indicação como indicado e como indicador
-    cur.execute("DELETE FROM indicacoes WHERE quem=? OR por=?", (uid, uid))
-    # Por fim, remove o registro do usuário
-    cur.execute("DELETE FROM usuarios WHERE telegram_id=?", (uid,))
-    con.commit()
+        c.execute("DELETE FROM saques WHERE telegram_id=?", (uid,))
+        c.execute("DELETE FROM withdrawals WHERE user_id=?", (uid,))
+        c.execute("DELETE FROM pagamentos WHERE user_id=?", (uid,))
+        c.execute("DELETE FROM indicacoes WHERE quem=? OR por=?", (uid, uid))
+        c.execute("DELETE FROM usuarios WHERE telegram_id=?", (uid,))
     await msg.answer(f"🗑️ Reset HARD aplicado ao uid {uid} (conta e dados removidos).")
-
 
 @dp.message(Command("appsaldo"))
 async def app_saldo(msg: types.Message):
-    if not is_admin(msg.from_user.id):
+    if not (is_admin(msg.from_user.id) and is_private_chat(msg)):
         return
     try:
         bals = get_app_balances()
@@ -1784,7 +1729,6 @@ async def app_saldo(msg: types.Message):
             linhas.append(f"{code}: disponível {avail} | bloqueado {locked}")
         texto = "💼 Saldos do App:\n" + "\n".join(linhas)
         await msg.answer(texto)
- 
     except Exception as e:
         await msg.answer(f"Erro ao obter saldos do app: {e}")
 
