@@ -1,6 +1,7 @@
 import asyncio
 from datetime import datetime, timedelta
 import hashlib
+import random
 import hmac
 import requests
 import httpx
@@ -311,6 +312,9 @@ def ensure_schema():
             c.execute("ALTER TABLE usuarios ADD COLUMN saldo_ton REAL DEFAULT 0.0")
         if not _column_exists(c, "usuarios", "saldo_materiais"):
             c.execute("ALTER TABLE usuarios ADD COLUMN saldo_materiais REAL DEFAULT 0.0")
+         # Controle de bônus diário (carimbo da última coleta)
+        if not _column_exists(c, "usuarios", "ultimo_bonus"):
+            c.execute("ALTER TABLE usuarios ADD COLUMN ultimo_bonus TEXT")    
 
         c.execute(
             """
@@ -517,6 +521,20 @@ def cb_check_and_use(token: str, user_id: int, action: str) -> tuple[bool, str |
         c.execute("UPDATE cb_tokens SET used=1 WHERE id=?", (token,))
         payload = row["payload"] if row["payload"] is not None else ""
         return True, payload, ""
+
+def _fmt_tempo_restante(delta: timedelta) -> str:
+    # arredonda para cima os minutos se houver segundos
+    total_seconds = int(delta.total_seconds())
+    if total_seconds <= 0:
+        return "agora"
+    horas = total_seconds // 3600
+    minutos = (total_seconds % 3600 + 59) // 60  # arredonda p/ cima
+    if horas > 0 and minutos > 0:
+        return f"{horas}h {minutos}min"
+    if horas > 0:
+        return f"{horas}h"
+    return f"{minutos}min"
+
 
 # ===== PRODUTIVIDADE (crescimento com o tempo) =====
 def _now():
@@ -761,10 +779,12 @@ def menu():
             [types.KeyboardButton(text="🐾 Meus Animais"), types.KeyboardButton(text="💰 Meu Saldo")],
             [types.KeyboardButton(text="🛒 Comprar"), types.KeyboardButton(text="➕ Depositar")],
             [types.KeyboardButton(text="🔄 Trocas"), types.KeyboardButton(text="🏦 Sacar")],
-            [types.KeyboardButton(text="👫 Indique & Ganhe"), types.KeyboardButton(text="❓ Ajuda/Suporte")]
+            [types.KeyboardButton(text="🎁 Bonus"), types.KeyboardButton(text="👫 Indique & Ganhe")],
+            [types.KeyboardButton(text="❓ Ajuda/Suporte")]
         ],
         resize_keyboard=True
     )
+
 
 # ========= HANDLERS =========
 @dp.message(Command('start'))
@@ -835,6 +855,113 @@ async def saldo(msg: types.Message):
         "Apenas 🧾 Cash de Pagamentos pode ser trocado por TON!"
     )
     await msg.answer(texto, parse_mode="Markdown")
+
+@dp.message(F.text.in_(["🎁 Bonus", "🎁Bonus"]))
+async def bonus_menu(msg: types.Message):
+    user_id = msg.from_user.id
+    ensure_user(user_id)
+
+    # Lê último bônus e calcula o que falta
+    with db_conn() as c:
+        r = c.execute(
+            "SELECT ultimo_bonus FROM usuarios WHERE telegram_id=?",
+            (user_id,)
+        ).fetchone()
+        ultimo = (r["ultimo_bonus"] if r else None)
+
+    agora = datetime.now()
+    faltam_txt = ""
+    if ultimo:
+        try:
+            dt_last = datetime.fromisoformat(ultimo)
+            proximo = dt_last + timedelta(hours=24)
+            if proximo > agora:
+                faltam = proximo - agora
+                faltam_txt = _fmt_tempo_restante(faltam)
+        except Exception:
+            pass
+
+    texto = (
+        "<b>Bônus diário</b>\n\n"
+        "Você pode obter o bônus a cada <b>24 horas</b>.\n"
+        "O bônus será pago em <b>💸 Cash Disponível</b>.\n"
+        "O bônus será gerado aleatoriamente entre <b>10 a 100</b> 💸."
+    )
+    if faltam_txt:
+        texto += f"\n\n⏳ Falta: <b>{faltam_txt}</b> para você poder pegar novamente."
+
+    # botão inline com timeout de 30s (via cb_tokens)
+    tok = cb_new(user_id, action="daily_bonus", payload="get", ttl=30)
+    kb = types.InlineKeyboardMarkup(inline_keyboard=[
+        [types.InlineKeyboardButton(text="🎁Pegar Bonus🎁", callback_data=f"bonus:{tok}")]
+    ])
+
+    await msg.answer(texto, parse_mode="HTML", reply_markup=kb)
+
+@dp.callback_query(F.data.startswith("bonus:"))
+async def pegar_bonus_cb(call: types.CallbackQuery):
+    user_id = call.from_user.id
+
+    # valida o token (30s) e a ação
+    try:
+        _, token = call.data.split(":", 1)
+    except Exception:
+        return await call.answer("Essa interação expirou. Por favor, tente novamente.", show_alert=True)
+
+    ok, payload, err = cb_check_and_use(token, user_id, action="daily_bonus")
+    if not ok:
+        return await call.answer(err, show_alert=True)
+
+    # Re-checa janela de 24h (evita corrida)
+    agora = datetime.now()
+    with db_conn() as c:
+        r = c.execute(
+            "SELECT COALESCE(saldo_cash,0) AS cash, ultimo_bonus FROM usuarios WHERE telegram_id=?",
+            (user_id,)
+        ).fetchone()
+        saldo_cash = float(r["cash"]) if r else 0.0
+        ultimo = r["ultimo_bonus"] if r else None
+
+    if ultimo:
+        try:
+            dt_last = datetime.fromisoformat(ultimo)
+            proximo = dt_last + timedelta(hours=24)
+            if proximo > agora:
+                # mantém a mensagem pedida (20 horas) + mostra quanto falta
+                faltam = proximo - agora
+                faltam_txt = _fmt_tempo_restante(faltam)
+                await call.message.answer(
+                    "⚠️ Você já recebeu um bônus nas últimas 20 horas.\n"
+                    f"⏳ Tente novamente em: <b>{faltam_txt}</b>.",
+                    parse_mode="HTML"
+                )
+                return await call.answer()
+        except Exception:
+            pass
+
+    # Tudo ok → sorteia 10..100 e credita SOMENTE em saldo_cash
+    valor = random.randint(10, 100)
+    novo_saldo = saldo_cash + valor
+
+    with db_conn() as c:
+        c.execute(
+            "UPDATE usuarios SET saldo_cash = COALESCE(saldo_cash,0) + ?, ultimo_bonus = ? WHERE telegram_id=?",
+            (valor, agora.isoformat(), user_id)
+        )
+        r2 = c.execute("SELECT COALESCE(saldo_cash,0) AS s FROM usuarios WHERE telegram_id=?",
+                       (user_id,)).fetchone()
+        novo_saldo = float(r2["s"]) if r2 else novo_saldo
+
+    await call.message.answer(
+        "🎉 <b>Bônus resgatado!</b>\n\n"
+        f"Você recebeu: <b>+{valor}</b> 💸\n"
+        f"Cash Disponível agora: <b>{int(novo_saldo)}</b> 💸\n\n"
+        "Volte em <b>24h</b> para pegar outro bônus!",
+        parse_mode="HTML"
+    )
+    await call.answer()
+
+
 
 @dp.message(F.text == "🛒 Comprar")
 async def comprar(msg: types.Message):
